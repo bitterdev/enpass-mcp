@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.local
+
+# Never commit vaults, backups or keys
+*.enpassdb
+*.enpassdb.backup-*
+*.enpassbackup
+*.keyfile
+vault.json
+
+# ...except the genuine SQLCipher test fixtures (dummy data, public password)
+!test/fixtures/*.enpassdb
+
+# OS / editor noise
+.DS_Store
+*.log
