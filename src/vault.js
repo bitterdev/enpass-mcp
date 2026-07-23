@@ -1,6 +1,7 @@
 /* Author: Fabian Bitter (fabian@bitter.de) */
 
 import fs from "node:fs";
+import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3-multiple-ciphers";
 import {
@@ -75,6 +76,10 @@ function withConnection(session, readonly, fn) {
 
 function tableInfo(db, table) {
   return db.prepare(`PRAGMA table_info(${table})`).all();
+}
+
+function hasTable(db, name) {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?").get(name);
 }
 
 function tableColumns(db, table) {
@@ -189,8 +194,134 @@ export function getItem(session, uuid) {
         value: f.value,
         sensitive: f.sensitive === 1 || f.sensitive === true,
       })),
+      attachments: attachmentMeta(db, uuid),
     };
   });
+}
+
+// --- attachments ---
+
+const EXTERNAL_ATTACHMENT_THRESHOLD = 1024;
+
+// Attachment metadata for an item (no file bytes). Enpass stores small files
+// (<= 1 KB) inline in the vault and larger files in separate SQLCipher databases
+// named "<attachment uuid>.enpassattach" next to the vault.
+function attachmentMeta(db, itemUuid) {
+  if (!hasTable(db, "attachment")) return [];
+  const cols = tableColumns(db, "attachment");
+  if (!cols.has("item_uuid")) return [];
+  const idExpr = cols.has("uuid") ? "uuid" : "rowid";
+  const select = [
+    `${idExpr} AS id`,
+    cols.has("name") ? "name" : "NULL AS name",
+    cols.has("size") ? "size" : "NULL AS size",
+    cols.has("mime") ? "mime" : "NULL AS mime",
+  ];
+  const delFilter = cols.has("deleted") ? "AND (deleted IS NULL OR deleted = 0)" : "";
+  const rows = db
+    .prepare(`SELECT ${select.join(", ")} FROM attachment WHERE item_uuid = ? ${delFilter}`)
+    .all(itemUuid);
+  return rows.map((r, i) => ({
+    index: i,
+    id: String(r.id),
+    name: r.name || null,
+    size: r.size ?? null,
+    mime: r.mime || null,
+  }));
+}
+
+export function listAttachments(session, itemUuid) {
+  return withConnection(session, true, (db) => attachmentMeta(db, itemUuid));
+}
+
+// Returns { name, mime, size, buffer } for one attachment, decrypting an external
+// ".enpassattach" file with its per-attachment key when necessary.
+export function readAttachment(session, itemUuid, selector) {
+  return withConnection(session, true, (db) => {
+    if (!hasTable(db, "attachment")) throw new Error("This vault has no attachments.");
+    const cols = tableColumns(db, "attachment");
+    if (!cols.has("item_uuid")) throw new Error("Attachment table has no item link.");
+    const delFilter = cols.has("deleted") ? "AND (deleted IS NULL OR deleted = 0)" : "";
+    const rows = db
+      .prepare(`SELECT rowid AS _rowid, * FROM attachment WHERE item_uuid = ? ${delFilter}`)
+      .all(itemUuid);
+
+    let row;
+    if (typeof selector === "number") {
+      row = rows[selector];
+    } else {
+      row = rows.find((r) => r.name === selector);
+      if (!row && /^\d+$/.test(String(selector))) row = rows[Number(selector)];
+    }
+    if (!row) throw new Error(`Attachment "${selector}" not found for item "${itemUuid}".`);
+
+    const name = row.name || `attachment-${row._rowid}`;
+    const mime = row.mime || "application/octet-stream";
+    const data = normalizeBlob(row.data);
+    const password = normalizeBlob(row.password);
+    const size = row.size ?? null;
+
+    let buffer;
+    const isExternal = password && password.length > 0 && (!data || data.length === 0 || (size != null && size > EXTERNAL_ATTACHMENT_THRESHOLD));
+    if (isExternal) {
+      const attId = cols.has("uuid") ? row.uuid : String(row._rowid);
+      buffer = readExternalAttachment(session.path, attId, password);
+    } else if (data && data.length > 0) {
+      buffer = data;
+    } else {
+      throw new Error(`Attachment "${name}" has no readable data.`);
+    }
+    return { name, mime, size: size ?? buffer.length, buffer };
+  });
+}
+
+function normalizeBlob(value) {
+  if (value == null) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  if (typeof value === "string") return Buffer.from(value);
+  return null;
+}
+
+function readExternalAttachment(vaultPath, attachmentId, keyBlob) {
+  const file = path.join(path.dirname(vaultPath), `${attachmentId}.enpassattach`);
+  if (!fs.existsSync(file)) {
+    throw new Error(`External attachment file not found: ${file}`);
+  }
+  const hexKey = keyBlob.toString("hex");
+  let lastError;
+  for (const compat of COMPAT_CANDIDATES) {
+    let db;
+    try {
+      db = new Database(file, { readonly: true, fileMustExist: true });
+      db.pragma("cipher='sqlcipher'");
+      db.pragma(`legacy=${compat}`);
+      db.pragma(`key="x'${hexKey}'"`);
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .all();
+      for (const t of tables) {
+        const tcols = tableInfo(db, t.name);
+        const blobCol = tcols.find((c) => /BLOB/i.test(c.type)) || tcols[tcols.length - 1];
+        if (!blobCol) continue;
+        const r = db.prepare(`SELECT "${blobCol.name}" AS data FROM "${t.name}" LIMIT 1`).get();
+        const buf = normalizeBlob(r && r.data);
+        if (buf && buf.length > 0) return buf;
+      }
+      throw new Error("No attachment data found inside the .enpassattach file.");
+    } catch (err) {
+      lastError = err;
+    } finally {
+      if (db) {
+        try {
+          db.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  throw new Error(`Failed to read external attachment (${lastError ? lastError.message : "unknown error"}).`);
 }
 
 // Backs up the vault file, then inserts a new entry. Enpass picks up the new

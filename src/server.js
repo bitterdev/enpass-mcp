@@ -1,5 +1,8 @@
 /* Author: Fabian Bitter (fabian@bitter.de) */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -13,6 +16,8 @@ import {
   listItems,
   getItem,
   createItem,
+  listAttachments,
+  readAttachment,
 } from "./vault.js";
 
 // Unlocked sessions: vault name -> { path, hexKey, compat }. The derived key
@@ -180,6 +185,72 @@ export function createServer() {
           password: password ? password.value : null,
           totp: totp ? totp.value : null,
         });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_attachments",
+    {
+      title: "List attachments",
+      description:
+        "Lists the file attachments of an entry in an unlocked vault (name, size, MIME). Use export_attachment to get the file itself.",
+      inputSchema: {
+        vault: z.string().describe("Registered vault name"),
+        uuid: z.string().describe("Entry uuid (from list_items)"),
+      },
+    },
+    async ({ vault, uuid }) => {
+      try {
+        const session = requireSession(vault);
+        const attachments = listAttachments(session, uuid);
+        return json({ vault, uuid, count: attachments.length, attachments });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "export_attachment",
+    {
+      title: "Export attachment",
+      description:
+        "Decrypts a file attachment from an unlocked vault. By default it writes the file to disk and returns the path (works for any size). Set inline=true to get small files as base64 instead.",
+      inputSchema: {
+        vault: z.string().describe("Registered vault name"),
+        uuid: z.string().describe("Entry uuid (from list_items)"),
+        attachment: z
+          .union([z.string(), z.number()])
+          .describe("Attachment name or index (from list_attachments)"),
+        dest: z.string().optional().describe("Destination directory (default: OS temp dir)"),
+        inline: z.boolean().optional().describe("Return small files as base64 instead of writing to disk"),
+      },
+    },
+    async ({ vault, uuid, attachment, dest, inline }) => {
+      try {
+        const session = requireSession(vault);
+        const selector = typeof attachment === "number"
+          ? attachment
+          : /^\d+$/.test(attachment) ? Number(attachment) : attachment;
+        const { name, mime, size, buffer } = readAttachment(session, uuid, selector);
+
+        if (inline) {
+          const MAX_INLINE = 256 * 1024;
+          if (buffer.length > MAX_INLINE) {
+            return fail(`File is ${buffer.length} bytes, too large for inline. Omit inline to export it to disk.`);
+          }
+          return json({ name, mime, size, encoding: "base64", data: buffer.toString("base64") });
+        }
+
+        const dir = dest || path.join(os.tmpdir(), "enpass-mcp-exports");
+        fs.mkdirSync(dir, { recursive: true });
+        const safeName = (name || "attachment").replace(/[^\w.\-]+/g, "_") || "attachment";
+        const outPath = path.join(dir, safeName);
+        fs.writeFileSync(outPath, buffer, { mode: 0o600 });
+        return json({ name, mime, size, path: outPath });
       } catch (err) {
         return fail(err.message);
       }

@@ -121,9 +121,14 @@ claude mcp add enpass -- enpass-mcp serve
 | `unlock_vault` | Unlock a vault using the master password from the OS keychain. Takes only a vault name, never a password. |
 | `lock_vault` | Lock a vault and clear its derived key from memory. |
 | `list_items` | List entries (title, username, URL). Never returns passwords. Supports `query`, `category`, `folder`, `limit`. |
-| `get_item` | Return a full entry including all field values (password, TOTP, etc.). |
+| `get_item` | Return a full entry including all field values (password, TOTP, etc.) and its attachment list. |
 | `get_password` | Return just the password (and TOTP) of an entry. |
+| `list_attachments` | List an entry's file attachments (name, size, MIME). |
+| `export_attachment` | Decrypt an attachment; writes it to disk and returns the path (or base64 inline for small files). |
 | `create_item` | Create a new entry. Backs up the vault file first. |
+
+`list_items` / `get_item` work for **every** Enpass entry type (logins, credit
+cards, secure notes, identities, etc.), not just logins, and return all fields.
 
 A typical assistant flow: `list_vaults` → `unlock_vault` → `list_items` → `get_password`.
 
@@ -143,6 +148,18 @@ process, and is never written to disk or returned to the model.
 
 References: [Enpass Security Whitepaper](https://support.enpass.io/docs/security-whitepaper-enpass/vault.html),
 [hazcod/enpass-cli](https://github.com/hazcod/enpass-cli).
+
+## Attachments
+
+Enpass keeps file attachments encrypted. Small files (up to 1 KB) sit inline in the
+vault; larger files live in separate `<uuid>.enpassattach` SQLCipher files next to the
+vault, each encrypted with its own key stored in the vault. `export_attachment` handles
+both: it decrypts the file and, by default, writes it to disk and returns the path, so
+it works for files of any size without pushing binary data through the model.
+
+External-attachment handling is implemented from Enpass's documented format. If you hit
+a vault whose attachments do not decrypt, please open an issue with the (non-secret)
+schema of your `attachment` table.
 
 ## Creating entries
 
@@ -165,8 +182,16 @@ Override the directory with `ENPASS_MCP_CONFIG_DIR`.
 ## Development
 
 ```bash
-npm test   # runs against genuine SQLCipher fixtures in test/fixtures
+npm test                    # runs against genuine SQLCipher fixtures in test/fixtures
+
+# Rebuild the fixtures from scratch with real SQLCipher (vault + entries + attachments)
+npm install --no-save @journeyapps/sqlcipher
+npm run generate-fixtures
 ```
+
+CI (GitHub Actions) creates a vault from scratch with real SQLCipher, seeds entries and
+attachments, then runs the full read/write test suite on Node 18/20/22, and separately
+verifies the shipped server reads the fixtures on macOS and Windows.
 
 ## Security notes and limitations
 

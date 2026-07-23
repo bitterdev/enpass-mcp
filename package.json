@@ -17,7 +17,8 @@
   "scripts": {
     "start": "node src/cli.js serve",
     "serve": "node src/cli.js serve",
-    "test": "node --test"
+    "test": "node --test",
+    "generate-fixtures": "node scripts/generate-fixtures.mjs"
   },
   "engines": {
     "node": ">=18"

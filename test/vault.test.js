@@ -11,6 +11,8 @@ import {
   listItems,
   getItem,
   createItem,
+  listAttachments,
+  readAttachment,
 } from "../src/vault.js";
 
 // The fixtures are genuine SQLCipher databases in the Enpass vault format
@@ -19,11 +21,17 @@ import {
 const MASTER = "Correct-Horse-Battery-Staple-9";
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
-// Copies a fixture to a temp file so write tests never mutate the committed vault.
+// Copies a fixture (and any external .enpassattach files) to a temp dir so write
+// tests never mutate the committed vault.
 function tempVault(fixture) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "enpass-mcp-test-"));
   const dest = path.join(dir, "vault.enpassdb");
   fs.copyFileSync(path.join(fixturesDir, fixture), dest);
+  for (const f of fs.readdirSync(fixturesDir)) {
+    if (f.endsWith(".enpassattach")) {
+      fs.copyFileSync(path.join(fixturesDir, f), path.join(dir, f));
+    }
+  }
   return dest;
 }
 
@@ -75,6 +83,45 @@ test("get_item returns the password and TOTP values", () => {
   assert.equal(password.value, "s3cr3t-token");
   assert.equal(password.sensitive, true);
   assert.equal(item.fields.find((f) => f.type === "totp").value, "otpauth://totp/demo");
+});
+
+test("get_item surfaces attachment metadata", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+  const item = getItem(session, "item-1");
+  assert.equal(item.attachments.length, 2);
+  assert.ok(item.attachments.some((a) => a.name === "note.txt"));
+  assert.ok(item.attachments.some((a) => a.name === "photo.bin"));
+});
+
+test("list_attachments and read inline attachment", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+
+  const attachments = listAttachments(session, "item-1");
+  assert.equal(attachments.length, 2);
+
+  const inline = readAttachment(session, "item-1", "note.txt");
+  assert.equal(inline.mime, "text/plain");
+  assert.equal(inline.buffer.toString("utf8"), "hello inline attachment");
+});
+
+test("read external .enpassattach attachment with per-file key", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+
+  const external = readAttachment(session, "item-1", "photo.bin");
+  assert.equal(external.size, 4096);
+  assert.equal(external.buffer.length, 4096);
+  assert.equal(external.buffer[0], 0xab);
+  assert.equal(external.buffer[4095], 0xab);
+});
+
+test("external attachments also work on compat-3 vaults", () => {
+  const vaultPath = tempVault("fixture-v3.enpassdb");
+  const { session } = unlock(vaultPath);
+  const external = readAttachment(session, "item-1", "photo.bin");
+  assert.equal(external.buffer.length, 4096);
 });
 
 test("create_item writes a new entry and backs up the vault", () => {
