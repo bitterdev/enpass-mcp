@@ -198,8 +198,7 @@ npm run generate-fixtures
 ```
 
 CI (GitHub Actions) creates a vault from scratch with real SQLCipher, seeds entries and
-attachments, then runs the full read/write test suite on Node 18/20/22, and separately
-verifies the shipped server reads the fixtures on macOS and Windows.
+attachments, then runs the full read/write test suite on Node 18/20/22.
 
 ## Security notes and limitations
 

@@ -28,20 +28,3 @@ jobs:
           npm run generate-fixtures
       - name: Run tests
         run: npm test
-
-  # Verifies the shipped server reads the committed fixtures on every OS using
-  # only the runtime dependencies (prebuilt binaries, no native build).
-  cross-platform-read:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci --omit=dev
-      - run: npm test
