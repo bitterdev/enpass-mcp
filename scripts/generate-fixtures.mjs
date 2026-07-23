@@ -41,7 +41,7 @@ async function seed(db, externalKeyHex) {
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f1','item-1','Username','username','octocat',0,1,0)`);
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f2','item-1','Password','password','s3cr3t-token',1,2,0)`);
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f3','item-1','Website','url','https://github.com',0,3,0)`);
-  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f4','item-1','TOTP','totp','otpauth://totp/demo',1,4,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f4','item-1','TOTP','totp','otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&period=30&digits=6',1,4,0)`);
   await run(db, `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite) VALUES('item-2','Bank','12345','finance','','finance.default',0,0,0)`);
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f5','item-2','PIN','password','9999',1,1,0)`);
 

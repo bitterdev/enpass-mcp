@@ -19,6 +19,11 @@ import {
   listAttachments,
   readAttachment,
 } from "./vault.js";
+import { computeOtp, isOtpValue } from "./otp.js";
+
+function findOtpField(item) {
+  return item.fields.find((f) => f.type === "totp" || isOtpValue(f.value));
+}
 
 // Unlocked sessions: vault name -> { path, hexKey, compat }. The derived key
 // lives in memory only, for the lifetime of this stdio process. It is never
@@ -177,13 +182,48 @@ export function createServer() {
         const item = await getItem(session, uuid);
         if (!item) return fail(`Entry "${uuid}" not found in vault "${vault}".`);
         const password = item.fields.find((f) => f.type === "password");
-        const totp = item.fields.find((f) => f.type === "totp");
+        const otpField = findOtpField(item);
+        const otp = otpField ? computeOtp(otpField.value) : null;
         return json({
           uuid: item.uuid,
           title: item.title,
           username: item.fields.find((f) => f.type === "username" || f.type === "email")?.value || null,
           password: password ? password.value : null,
-          totp: totp ? totp.value : null,
+          otp: otp ? otp.code : null,
+          otp_seconds_remaining: otp ? otp.secondsRemaining : null,
+        });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_otp",
+    {
+      title: "Get one-time code",
+      description:
+        "Generates the current TOTP / two-factor one-time code for an entry that stores an OTP secret. Returns the code and how many seconds until it rotates, so it can be entered for 2FA.",
+      inputSchema: {
+        vault: z.string().describe("Registered vault name"),
+        uuid: z.string().describe("Entry uuid (from list_items)"),
+      },
+    },
+    async ({ vault, uuid }) => {
+      try {
+        const session = requireSession(vault);
+        const item = getItem(session, uuid);
+        if (!item) return fail(`Entry "${uuid}" not found in vault "${vault}".`);
+        const otpField = findOtpField(item);
+        if (!otpField) return fail(`Entry "${item.title}" has no OTP / 2FA secret.`);
+        const otp = computeOtp(otpField.value);
+        if (!otp) return fail("Could not generate a one-time code from the stored secret.");
+        return json({
+          uuid: item.uuid,
+          title: item.title,
+          code: otp.code,
+          secondsRemaining: otp.secondsRemaining,
+          period: otp.period,
         });
       } catch (err) {
         return fail(err.message);

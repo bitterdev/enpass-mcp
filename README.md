@@ -122,7 +122,8 @@ claude mcp add enpass -- enpass-mcp serve
 | `lock_vault` | Lock a vault and clear its derived key from memory. |
 | `list_items` | List entries (title, username, URL). Never returns passwords. Supports `query`, `category`, `folder`, `limit`. |
 | `get_item` | Return a full entry including all field values (password, TOTP, etc.) and its attachment list. |
-| `get_password` | Return just the password (and TOTP) of an entry. |
+| `get_password` | Return the password and, if present, the current TOTP code of an entry. |
+| `get_otp` | Generate the current TOTP / 2FA one-time code for an entry, with seconds until it rotates. |
 | `list_attachments` | List an entry's file attachments (name, size, MIME). |
 | `export_attachment` | Decrypt an attachment; writes it to disk and returns the path (or base64 inline for small files). |
 | `create_item` | Create a new entry. Backs up the vault file first. |
@@ -148,6 +149,13 @@ process, and is never written to disk or returned to the model.
 
 References: [Enpass Security Whitepaper](https://support.enpass.io/docs/security-whitepaper-enpass/vault.html),
 [hazcod/enpass-cli](https://github.com/hazcod/enpass-cli).
+
+## Two-factor codes (TOTP)
+
+Entries with a one-time-password secret (stored by Enpass as an `otpauth://` URI)
+can produce a live 2FA code: `get_otp` returns the current 6-digit code and the
+seconds until it rotates, and `get_password` includes the current code alongside the
+password. This lets an assistant fill both the password and the 2FA prompt.
 
 ## Attachments
 

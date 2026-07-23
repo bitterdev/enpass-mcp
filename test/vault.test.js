@@ -14,6 +14,7 @@ import {
   listAttachments,
   readAttachment,
 } from "../src/vault.js";
+import { computeOtp } from "../src/otp.js";
 
 // The fixtures are genuine SQLCipher databases in the Enpass vault format
 // (cipher_compatibility 4 and 3, PBKDF2-HMAC-SHA512, 100000 iterations),
@@ -107,7 +108,33 @@ test("get_item returns the password and TOTP values", () => {
   const password = item.fields.find((f) => f.type === "password");
   assert.equal(password.value, "s3cr3t-token");
   assert.equal(password.sensitive, true);
-  assert.equal(item.fields.find((f) => f.type === "totp").value, "otpauth://totp/demo");
+  assert.ok(item.fields.find((f) => f.type === "totp").value.startsWith("otpauth://"));
+});
+
+test("computes TOTP one-time codes from a stored secret", () => {
+  // Deterministic at a fixed timestamp; matches any standard authenticator app.
+  const fromUri = computeOtp(
+    "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub",
+    0,
+  );
+  assert.equal(fromUri.code, "282760");
+  assert.equal(fromUri.period, 30);
+  assert.equal(fromUri.secondsRemaining, 30);
+
+  const fromBareSecret = computeOtp("JBSWY3DPEHPK3PXP", 0);
+  assert.equal(fromBareSecret.code, "282760");
+
+  assert.equal(computeOtp("!!!not-base32!!!", 0), null);
+  assert.equal(computeOtp(null), null);
+});
+
+test("get_otp end via vault fields on the fixture entry", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+  const item = getItem(session, "item-1");
+  const otpField = item.fields.find((f) => f.type === "totp");
+  const otp = computeOtp(otpField.value, 0);
+  assert.equal(otp.code, "282760");
 });
 
 test("get_item surfaces attachment metadata", () => {
