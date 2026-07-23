@@ -89,6 +89,8 @@ export function discoverVaults() {
     path.join(home, "Documents", "Enpass"),
     path.join(home, "Enpass"),
     path.join(home, "Library", "Application Support", "Enpass"),
+    // macOS sandboxed desktop app container (working vaults)
+    path.join(home, "Library", "Containers", "in.sinew.Enpass-Desktop", "Data", "Documents", "Vaults"),
     path.join(home, "OneDrive", "Enpass"),
     path.join(home, "Dropbox", "Enpass"),
   ];

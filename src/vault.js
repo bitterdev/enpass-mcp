@@ -174,11 +174,16 @@ export function getItem(session, uuid) {
       .get(uuid);
     if (!item) return null;
 
+    // Field ordering varies across Enpass schema versions; some vaults have no
+    // "order" column. Order by it only when present, otherwise by rowid.
+    const fieldCols = tableColumns(db, "itemfield");
+    const orderBy = fieldCols.has("order") ? `"order"` : "rowid";
+    const delFilter = fieldCols.has("deleted") ? "AND (deleted IS NULL OR deleted = 0)" : "";
     const fields = db
       .prepare(
         `SELECT label, type, value, sensitive FROM itemfield
-         WHERE item_uuid = ? AND (deleted IS NULL OR deleted = 0)
-         ORDER BY "order"`,
+         WHERE item_uuid = ? ${delFilter}
+         ORDER BY ${orderBy}`,
       )
       .all(uuid);
 
