@@ -27,6 +27,30 @@ function registryPath() {
   return path.join(configDir(), REGISTRY_FILE);
 }
 
+// Loads "<configDir>/.env" into process.env (without overriding existing values).
+// This is where an optional shared master password (ENPASS_MASTER_PASSWORD) lives,
+// kept outside the project so it is never committed. Best-effort; no dependency.
+function loadConfigEnv() {
+  try {
+    const content = fs.readFileSync(path.join(configDir(), ".env"), "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!match || line.trim().startsWith("#")) continue;
+      const key = match[1];
+      if (key in process.env) continue;
+      let value = match[2].trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  } catch {
+    // no config .env
+  }
+}
+
+loadConfigEnv();
+
 export function loadRegistry() {
   try {
     const raw = fs.readFileSync(registryPath(), "utf8");
@@ -131,10 +155,13 @@ export function setSecret(name, password) {
 
 export function getSecret(name) {
   try {
-    return entryFor(name).getPassword();
+    const stored = entryFor(name).getPassword();
+    if (stored) return stored;
   } catch {
-    return null;
+    // fall through to shared password
   }
+  // Optional shared master password for vaults that use the same passphrase.
+  return process.env[`ENPASS_MASTER_PASSWORD_${name.toUpperCase()}`] || process.env.ENPASS_MASTER_PASSWORD || null;
 }
 
 export function hasSecret(name) {
