@@ -1,6 +1,7 @@
 {
   "name": "enpass-mcp",
   "version": "0.1.0",
+  "mcpName": "io.github.bitterdev/enpass-mcp",
   "description": "Model Context Protocol (MCP) server for Enpass vaults: unlock, list vaults, list and read entries, create entries. Master passwords are kept in the OS keychain and never pass through the model.",
   "type": "module",
   "bin": {
