@@ -37,7 +37,7 @@ prebuilt binaries for common platforms, so no compiler is required in the normal
 ## Install
 
 ```bash
-git clone https://github.com/fabianbitter/enpass-mcp.git
+git clone https://github.com/bitterdev/enpass-mcp.git
 cd enpass-mcp
 npm install
 npm link   # optional: makes the `enpass-mcp` command available globally
