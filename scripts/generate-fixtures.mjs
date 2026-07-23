@@ -44,6 +44,18 @@ async function seed(db, externalKeyHex) {
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f4','item-1','TOTP','totp','otpauth://totp/demo',1,4,0)`);
   await run(db, `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite) VALUES('item-2','Bank','12345','finance','','finance.default',0,0,0)`);
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f5','item-2','PIN','password','9999',1,1,0)`);
+
+  // Credit card entry (non-login type with sensitive fields)
+  await run(db, `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite) VALUES('item-3','Visa Card','John Doe','creditcard','','creditcard.default',0,0,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f6','item-3','Cardholder','text','John Doe',0,1,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f7','item-3','Card Number','ccNumber','4111111111111111',1,2,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f8','item-3','CVC','ccCvc','123',1,3,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f9','item-3','Expiry','ccExpiry','12/28',0,4,0)`);
+
+  // Secure note entry (note plus a hidden custom field)
+  await run(db, `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite) VALUES('item-4','Server Notes','','note','root password rotation schedule','note.default',0,0,0)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f10','item-4','Recovery Key','password','REC-KEY-XYZ',1,1,0)`);
+
   await run(db, `INSERT INTO folder(uuid,title) VALUES('fold-1','Work')`);
   await run(db, `INSERT INTO folder_item(folder_uuid,item_uuid) VALUES('fold-1','item-1')`);
 

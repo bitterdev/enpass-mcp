@@ -56,22 +56,47 @@ test("unlock auto-detects older cipher_compatibility 3 vaults", () => {
   assert.equal(params.compat, 3);
 });
 
-test("list_items returns entries without exposing secrets", () => {
+test("list_items returns every entry type without exposing secrets", () => {
   const vaultPath = tempVault("fixture-v4.enpassdb");
   const { session } = unlock(vaultPath);
 
   const items = listItems(session, {});
-  assert.equal(items.length, 2);
+  assert.equal(items.length, 4);
+  const titles = items.map((i) => i.title).sort();
+  assert.deepEqual(titles, ["Bank", "GitHub", "Server Notes", "Visa Card"]);
+
   const github = items.find((i) => i.title === "GitHub");
   assert.equal(github.username, "octocat");
   assert.equal(github.url, "https://github.com");
-  assert.equal(JSON.stringify(items).includes("s3cr3t-token"), false);
-  assert.equal(JSON.stringify(items).includes("9999"), false);
+
+  const dump = JSON.stringify(items);
+  for (const secret of ["s3cr3t-token", "9999", "4111111111111111", "REC-KEY-XYZ"]) {
+    assert.equal(dump.includes(secret), false, `list_items must not leak ${secret}`);
+  }
 
   assert.equal(listItems(session, { query: "hub" }).length, 1);
   assert.equal(listItems(session, { query: "nonexistent" }).length, 0);
   assert.equal(listItems(session, { category: "finance" }).length, 1);
+  assert.equal(listItems(session, { category: "creditcard" }).length, 1);
+  assert.equal(listItems(session, { category: "note" }).length, 1);
   assert.equal(listItems(session, { folder: "Work" }).length, 1);
+});
+
+test("get_item reads all field types across entry categories", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+
+  const card = getItem(session, "item-3");
+  assert.equal(card.category, "creditcard");
+  const number = card.fields.find((f) => f.type === "ccNumber");
+  assert.equal(number.value, "4111111111111111");
+  assert.equal(number.sensitive, true);
+  assert.equal(card.fields.find((f) => f.label === "Expiry").value, "12/28");
+
+  const note = getItem(session, "item-4");
+  assert.equal(note.category, "note");
+  assert.equal(note.note, "root password rotation schedule");
+  assert.equal(note.fields.find((f) => f.type === "password").value, "REC-KEY-XYZ");
 });
 
 test("get_item returns the password and TOTP values", () => {
@@ -127,6 +152,7 @@ test("external attachments also work on compat-3 vaults", () => {
 test("create_item writes a new entry and backs up the vault", () => {
   const vaultPath = tempVault("fixture-v4.enpassdb");
   const { session } = unlock(vaultPath);
+  const before = listItems(session, {}).length;
 
   const result = createItem(session, {
     title: "GitLab",
@@ -141,5 +167,35 @@ test("create_item writes a new entry and backs up the vault", () => {
   const created = getItem(session, result.uuid);
   assert.equal(created.title, "GitLab");
   assert.equal(created.fields.find((f) => f.type === "password").value, "new-pass-123");
-  assert.equal(listItems(session, {}).length, 3);
+  assert.equal(listItems(session, {}).length, before + 1);
+});
+
+test("create_item saves non-login types with sensitive custom fields", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+
+  const card = createItem(session, {
+    title: "Amex",
+    category: "creditcard",
+    note: "backup card",
+    fields: [
+      { label: "Cardholder", value: "Jane Doe", type: "text", sensitive: false },
+      { label: "Card Number", value: "378282246310005", type: "ccNumber", sensitive: true },
+      { label: "CVC", value: "1234", type: "ccCvc", sensitive: true },
+    ],
+  });
+
+  const readBack = getItem(session, card.uuid);
+  assert.equal(readBack.category, "creditcard");
+  assert.equal(readBack.note, "backup card");
+  const number = readBack.fields.find((f) => f.label === "Card Number");
+  assert.equal(number.value, "378282246310005");
+  assert.equal(number.type, "ccNumber");
+  assert.equal(number.sensitive, true);
+  const holder = readBack.fields.find((f) => f.label === "Cardholder");
+  assert.equal(holder.sensitive, false);
+
+  // persisted to disk: a fresh unlock still sees it
+  const reopened = unlock(vaultPath);
+  assert.ok(getItem(reopened.session, card.uuid));
 });

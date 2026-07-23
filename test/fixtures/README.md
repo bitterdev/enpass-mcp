@@ -14,6 +14,10 @@ Both use PBKDF2-HMAC-SHA512 with 100000 iterations and a 16-byte header salt,
 matching how Enpass derives its raw SQLCipher key. They were generated with real
 SQLCipher so the tests validate the derivation end to end.
 
+Each vault seeds several entry types to prove type-agnostic reading: a login
+(GitHub), a finance entry (Bank), a credit card (Visa Card, with sensitive card
+number and CVC) and a secure note (Server Notes).
+
 They also contain attachments:
 
 - an inline attachment (`note.txt`, stored directly in the vault)
