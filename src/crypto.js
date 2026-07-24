@@ -49,3 +49,72 @@ export function deriveHexKey(masterSecret, salt, iterations) {
   const derived = crypto.pbkdf2Sync(secret, salt, iterations, 64, "sha512");
   return derived.toString("hex").slice(0, 64);
 }
+
+// --- per-item field encryption ---
+//
+// On top of SQLCipher, Enpass encrypts every value flagged as "sensitive" a second
+// time with a per-item key stored in `item.key`. Fields carrying this second layer
+// have `itemfield.algo_version = 1`; older vaults store such values in the clear.
+//
+// The layout, verified against a live schema-version-6 vault:
+//   item.key           44 bytes: 32-byte AES-256 key || 12-byte GCM nonce
+//   itemfield.value    hex string: ciphertext || 16-byte GCM auth tag
+//   additional data    the item's UUID as raw bytes (hyphens stripped, hex-decoded)
+//
+// Binding the AAD to the item UUID is what makes a field value unusable if it is
+// copied into another item, so the UUID must be passed exactly as stored.
+export const FIELD_KEY_LENGTH = 32;
+export const FIELD_NONCE_LENGTH = 12;
+export const FIELD_TAG_LENGTH = 16;
+export const ENCRYPTED_ALGO_VERSION = 1;
+
+// True when a stored value has the shape of a GCM payload (pure hex, whole bytes,
+// longer than the auth tag alone). Enpass did not re-encrypt older entries when it
+// introduced this layer, so a vault mixes ciphertext and plaintext under the same
+// `algo_version = 1`, and the format is the only thing that tells them apart.
+export function looksEncrypted(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (!/^(?:[0-9a-f]{2})+$/i.test(value)) return false;
+  return value.length / 2 > FIELD_TAG_LENGTH;
+}
+
+function itemUuidToAad(itemUuid) {
+  const compact = String(itemUuid).replace(/-/g, "");
+  if (!/^[0-9a-f]{32}$/i.test(compact)) return null;
+  return Buffer.from(compact, "hex");
+}
+
+// Decrypts one sensitive field value. Returns the plaintext, or null when the value
+// cannot be decrypted (unknown algo version, missing/short item key, malformed hex,
+// failed authentication). Callers decide how to surface that; never fall back to
+// returning the raw ciphertext, which would look like a valid secret.
+export function decryptFieldValue(value, itemKey, itemUuid, algoVersion) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (algoVersion !== undefined && algoVersion !== ENCRYPTED_ALGO_VERSION) return null;
+  if (!itemKey || itemKey.length < FIELD_KEY_LENGTH + FIELD_NONCE_LENGTH) return null;
+  if (!/^(?:[0-9a-f]{2})+$/i.test(value)) return null;
+
+  const aad = itemUuidToAad(itemUuid);
+  if (!aad) return null;
+
+  const payload = Buffer.from(value, "hex");
+  if (payload.length <= FIELD_TAG_LENGTH) return null;
+
+  try {
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      itemKey.subarray(0, FIELD_KEY_LENGTH),
+      itemKey.subarray(FIELD_KEY_LENGTH, FIELD_KEY_LENGTH + FIELD_NONCE_LENGTH),
+      { authTagLength: FIELD_TAG_LENGTH },
+    );
+    decipher.setAAD(aad);
+    decipher.setAuthTag(payload.subarray(payload.length - FIELD_TAG_LENGTH));
+    const plaintext = Buffer.concat([
+      decipher.update(payload.subarray(0, payload.length - FIELD_TAG_LENGTH)),
+      decipher.final(),
+    ]);
+    return plaintext.toString("utf8");
+  } catch {
+    return null;
+  }
+}

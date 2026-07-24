@@ -30,9 +30,33 @@ function deriveHexKey(password, salt, iterations) {
   return crypto.pbkdf2Sync(Buffer.from(password, "utf8"), salt, iterations, 64, "sha512").toString("hex").slice(0, 64);
 }
 
+// Item whose sensitive fields carry Enpass's per-item encryption layer
+// (`item.key`, `itemfield.algo_version = 1`). Its uuid must be a real hex uuid
+// because the item uuid doubles as the AAD.
+export const ENCRYPTED_ITEM_UUID = "3f2b7c10-4d5e-4a8b-9c1d-2e3f4a5b6c7d";
+// 32-byte AES key || 12-byte GCM nonce, exactly as Enpass stores it in item.key.
+export const ENCRYPTED_ITEM_KEY = Buffer.from(
+  "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" + "a0a1a2a3a4a5a6a7a8a9aaab",
+  "hex",
+);
+export const ENCRYPTED_PASSWORD = "6sxNl3vgohOqRtgY6L0DMA";
+export const LEGACY_PLAINTEXT_LICENCE = "MG-8NZ2W-TQPQT-H5BR1";
+
+// Mirrors what Enpass writes: AES-256-GCM over the value, keyed by item.key, with
+// the item uuid (hyphens stripped) as additional authenticated data, stored as
+// hex(ciphertext || tag).
+function encryptFieldValue(plaintext, itemKey, itemUuid) {
+  const cipher = crypto.createCipheriv("aes-256-gcm", itemKey.subarray(0, 32), itemKey.subarray(32, 44), {
+    authTagLength: 16,
+  });
+  cipher.setAAD(Buffer.from(itemUuid.replace(/-/g, ""), "hex"));
+  const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return Buffer.concat([ct, cipher.getAuthTag()]).toString("hex");
+}
+
 async function seed(db, externalKeyHex) {
-  await run(db, `CREATE TABLE item(uuid TEXT PRIMARY KEY,title TEXT,subtitle TEXT,category TEXT,note TEXT,template_type TEXT,created_at INTEGER,updated_at INTEGER,meta_updated_at INTEGER,favorite INTEGER,archived INTEGER,trashed INTEGER,deleted INTEGER)`);
-  await run(db, `CREATE TABLE itemfield(uuid TEXT,item_uuid TEXT,label TEXT,type TEXT,value TEXT,sensitive INTEGER,"order" INTEGER,deleted INTEGER,updated_at INTEGER,value_updated_at INTEGER,hash TEXT)`);
+  await run(db, `CREATE TABLE item(uuid TEXT PRIMARY KEY,title TEXT,subtitle TEXT,category TEXT,note TEXT,template_type TEXT,created_at INTEGER,updated_at INTEGER,meta_updated_at INTEGER,favorite INTEGER,archived INTEGER,trashed INTEGER,deleted INTEGER,key BLOB)`);
+  await run(db, `CREATE TABLE itemfield(uuid TEXT,item_uuid TEXT,label TEXT,type TEXT,value TEXT,sensitive INTEGER,"order" INTEGER,deleted INTEGER,updated_at INTEGER,value_updated_at INTEGER,hash TEXT,algo_version INTEGER)`);
   await run(db, `CREATE TABLE folder(uuid TEXT PRIMARY KEY,title TEXT,updated_at INTEGER,parent_uuid TEXT)`);
   await run(db, `CREATE TABLE folder_item(folder_uuid TEXT,item_uuid TEXT)`);
   await run(db, `CREATE TABLE attachment(uuid TEXT PRIMARY KEY,item_uuid TEXT,name TEXT,size INTEGER,mime TEXT,kind TEXT,password BLOB,data BLOB,updated_at INTEGER,deleted INTEGER)`);
@@ -55,6 +79,22 @@ async function seed(db, externalKeyHex) {
   // Secure note entry (note plus a hidden custom field)
   await run(db, `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite) VALUES('item-4','Server Notes','','note','root password rotation schedule','note.default',0,0,0)`);
   await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted) VALUES('f10','item-4','Recovery Key','password','REC-KEY-XYZ',1,1,0)`);
+
+  // Entry using the per-item encryption layer. It also carries an empty built-in
+  // password field ahead of the real, labelled ones (the shape Enpass produces for a
+  // login whose credentials live in custom fields) and one legacy value that Enpass
+  // left in plaintext when it introduced the layer.
+  const enc = (v) => encryptFieldValue(v, ENCRYPTED_ITEM_KEY, ENCRYPTED_ITEM_UUID);
+  await runP(
+    db,
+    `INSERT INTO item(uuid,title,subtitle,category,note,template_type,trashed,deleted,favorite,key) VALUES(?,?,?,?,?,?,0,0,0,?)`,
+    [ENCRYPTED_ITEM_UUID, "Mail Bridge", "127.0.0.1", "login", "", "login.default", ENCRYPTED_ITEM_KEY],
+  );
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted,algo_version) VALUES('f11','${ENCRYPTED_ITEM_UUID}','','password','',1,1,0,1)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted,algo_version) VALUES('f12','${ENCRYPTED_ITEM_UUID}','Username (IMAP)','username','fabian@example.com',0,2,0,1)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted,algo_version) VALUES('f13','${ENCRYPTED_ITEM_UUID}','Password (IMAP)','password','${enc(ENCRYPTED_PASSWORD)}',1,3,0,1)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted,algo_version) VALUES('f14','${ENCRYPTED_ITEM_UUID}','TOTP','totp','${enc("otpauth://totp/Bridge:fabian?secret=JBSWY3DPEHPK3PXP&issuer=Bridge&period=30&digits=6")}',1,4,0,1)`);
+  await run(db, `INSERT INTO itemfield(uuid,item_uuid,label,type,value,sensitive,"order",deleted,algo_version) VALUES('f15','${ENCRYPTED_ITEM_UUID}','Licence','text','${LEGACY_PLAINTEXT_LICENCE}',1,5,0,1)`);
 
   await run(db, `INSERT INTO folder(uuid,title) VALUES('fold-1','Work')`);
   await run(db, `INSERT INTO folder_item(folder_uuid,item_uuid) VALUES('fold-1','item-1')`);

@@ -20,7 +20,9 @@ system's keychain and read directly by the server.
   directly with SQLCipher. Nothing is uploaded anywhere.
 - **Reads are explicit.** Listing entries never returns passwords. Secrets are only
   returned by `get_item` / `get_password`, when you explicitly ask for them.
-- **Writes are backed up.** `create_item` copies the vault file before writing.
+- **Read-only.** The server never modifies the vault. Writing entries directly into
+  the SQLCipher database corrupts recent Enpass vaults and crashes the app, so
+  creating entries is left to the Enpass app itself.
 
 Entry passwords are, by design, returned to the assistant when you ask for them, so
 only connect this to an assistant and vaults you trust.
@@ -126,7 +128,9 @@ claude mcp add enpass -- enpass-mcp serve
 | `get_otp` | Generate the current TOTP / 2FA one-time code for an entry, with seconds until it rotates. |
 | `list_attachments` | List an entry's file attachments (name, size, MIME). |
 | `export_attachment` | Decrypt an attachment; writes it to disk and returns the path (or base64 inline for small files). |
-| `create_item` | Create a new entry. Backs up the vault file first. |
+
+The server is **read-only**: there is no tool to create or modify entries (see
+[Why there is no write support](#why-there-is-no-write-support)).
 
 `list_items` / `get_item` work for **every** Enpass entry type (logins, credit
 cards, secure notes, identities, etc.), not just logins, and return all fields.
@@ -150,6 +154,29 @@ process, and is never written to disk or returned to the model.
 References: [Enpass Security Whitepaper](https://support.enpass.io/docs/security-whitepaper-enpass/vault.html),
 [hazcod/enpass-cli](https://github.com/hazcod/enpass-cli).
 
+## Per-item field encryption
+
+Enpass encrypts every value flagged as "sensitive" a second time, underneath
+SQLCipher, with a key that belongs to the entry rather than the vault. Fields
+carrying that layer have `itemfield.algo_version = 1`:
+
+| Piece | Where | Layout |
+| --- | --- | --- |
+| Key and nonce | `item.key` | 44 bytes: 32-byte AES-256 key, then a 12-byte GCM nonce |
+| Value | `itemfield.value` | hex of `ciphertext \|\| 16-byte GCM tag` |
+| Additional data | the entry's uuid | hyphens stripped, hex-decoded to 16 raw bytes |
+
+Binding the AAD to the entry uuid is what makes a value unusable if it is copied into
+another entry. Enpass did **not** re-encrypt existing entries when it introduced this
+layer, so one vault mixes ciphertext and plaintext under the same `algo_version`; a
+value is treated as encrypted only when it has the shape of a payload (pure hex, whole
+bytes, longer than the tag on its own).
+
+A value that looks encrypted but fails authentication is returned as `null` with
+`decryptionFailed: true`, never as the raw column content: stored ciphertext is a
+plausible-looking string, and handing that back would silently pass off a wrong secret
+as a real one.
+
 ## Two-factor codes (TOTP)
 
 Entries with a one-time-password secret (stored by Enpass as an `otpauth://` URI)
@@ -169,12 +196,14 @@ External-attachment handling is implemented from Enpass's documented format. If 
 a vault whose attachments do not decrypt, please open an issue with the (non-secret)
 schema of your `attachment` table.
 
-## Creating entries
+## Why there is no write support
 
-`create_item` inserts a new item and its fields into the vault and creates a
-`*.backup-<timestamp>` copy of the vault file first. Enpass picks up the new entry on
-its next sync. Close the Enpass app (or let it sync) to avoid write conflicts, and keep
-the backup until you have confirmed the entry looks right.
+This MCP is read-only by design. Recent Enpass vaults (schema version 6) do not
+tolerate entries inserted directly into the SQLCipher database: Enpass crashes when it
+loads such a vault. Even a fully structured, **non-sensitive-only** entry (correct
+`template`, `orde`, `item_field_uid`, `icon`, no sensitive fields) still crashes the
+app, so Enpass rejects externally inserted items regardless of field encryption. This
+was verified end to end against a real vault. To add entries, use the Enpass app itself.
 
 ## Configuration
 
@@ -198,15 +227,16 @@ npm run generate-fixtures
 ```
 
 CI (GitHub Actions) creates a vault from scratch with real SQLCipher, seeds entries and
-attachments, then runs the full read/write test suite on Node 18/20/22.
+attachments, then runs the full read-only test suite on Node 18/20/22.
 
 ## Security notes and limitations
 
 - Anyone who can talk to this MCP server can read every password in a vault once it is
   unlocked. Only connect trusted clients.
-- The server does not implement Enpass sync, attachments, item history, or trashing.
-- `create_item` writes directly to the vault database. It is best-effort across Enpass
-  schema versions and always makes a backup, but review new entries in Enpass.
+- The server does not implement Enpass sync, item history, or trashing.
+- The server is read-only and never modifies a vault. Creating or editing entries is
+  intentionally not supported, because direct database writes crash recent Enpass
+  vaults (see [Why there is no write support](#why-there-is-no-write-support)).
 - This is an independent project and is not affiliated with or endorsed by Enpass.
 
 ## License

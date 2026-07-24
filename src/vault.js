@@ -2,12 +2,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import Database from "better-sqlite3-multiple-ciphers";
 import {
   readSalt,
   buildMasterSecret,
   deriveHexKey,
+  decryptFieldValue,
+  looksEncrypted,
+  ENCRYPTED_ALGO_VERSION,
   ITERATION_CANDIDATES,
   COMPAT_CANDIDATES,
 } from "./crypto.js";
@@ -86,16 +88,6 @@ function tableColumns(db, table) {
   return new Set(tableInfo(db, table).map((r) => r.name));
 }
 
-// A type-appropriate zero value for a NOT NULL column we do not otherwise set,
-// so inserts succeed across Enpass schema versions with extra required columns.
-function zeroValueForType(type) {
-  const t = String(type || "").toUpperCase();
-  if (t.includes("INT")) return 0;
-  if (t.includes("REAL") || t.includes("FLOA") || t.includes("DOUB")) return 0;
-  if (t.includes("BLOB")) return Buffer.alloc(0);
-  return "";
-}
-
 function itemFilter(columns) {
   const clauses = [];
   if (columns.has("trashed")) clauses.push("(item.trashed IS NULL OR item.trashed = 0)");
@@ -109,6 +101,31 @@ function pickValue(fields, types) {
     if (found) return found.value;
   }
   return null;
+}
+
+// Maps one raw `itemfield` row to the shape callers see, decrypting the value when
+// the vault stores it with the per-item encryption layer (algo_version = 1).
+//
+// A failed decryption yields a null value, never the raw column content: the stored
+// ciphertext is a plausible-looking string, and returning it silently hands the caller
+// a wrong secret instead of an error.
+function resolveField(row, itemKey, itemUuid) {
+  const sensitive = row.sensitive === 1 || row.sensitive === true;
+  const field = { label: row.label, type: row.type, value: row.value, sensitive };
+  // algo_version 0 (or absent) means the value is already plaintext behind SQLCipher.
+  if (!sensitive || !row.value || row.algo_version !== ENCRYPTED_ALGO_VERSION) return field;
+  // Entries written before Enpass added the per-item layer still carry plaintext
+  // under algo_version 1, so pass anything that is not shaped like a payload through.
+  if (!looksEncrypted(row.value)) return field;
+
+  const plaintext = decryptFieldValue(row.value, itemKey, itemUuid, row.algo_version);
+  if (plaintext === null) {
+    field.value = null;
+    field.decryptionFailed = true;
+  } else {
+    field.value = plaintext;
+  }
+  return field;
 }
 
 // Lists entries in a vault without exposing sensitive field values.
@@ -169,19 +186,26 @@ export function getItem(session, uuid) {
     const selectCat = itemCols.has("category") ? "category" : "NULL AS category";
     const selectNote = itemCols.has("note") ? "note" : "NULL AS note";
 
+    // `item.key` carries the per-item key that sensitive field values are encrypted
+    // with; vaults predating that layer have no such column.
+    const selectKey = itemCols.has("key") ? "key" : "NULL AS key";
     const item = db
-      .prepare(`SELECT uuid, title, ${selectSub}, ${selectCat}, ${selectNote} FROM item WHERE uuid = ?`)
+      .prepare(
+        `SELECT uuid, title, ${selectSub}, ${selectCat}, ${selectNote}, ${selectKey} FROM item WHERE uuid = ?`,
+      )
       .get(uuid);
     if (!item) return null;
+    const itemKey = normalizeBlob(item.key);
 
     // Field ordering varies across Enpass schema versions; some vaults have no
     // "order" column. Order by it only when present, otherwise by rowid.
     const fieldCols = tableColumns(db, "itemfield");
     const orderBy = fieldCols.has("order") ? `"order"` : "rowid";
     const delFilter = fieldCols.has("deleted") ? "AND (deleted IS NULL OR deleted = 0)" : "";
+    const selectAlgo = fieldCols.has("algo_version") ? "algo_version" : "NULL AS algo_version";
     const fields = db
       .prepare(
-        `SELECT label, type, value, sensitive FROM itemfield
+        `SELECT label, type, value, sensitive, ${selectAlgo} FROM itemfield
          WHERE item_uuid = ? ${delFilter}
          ORDER BY ${orderBy}`,
       )
@@ -193,12 +217,7 @@ export function getItem(session, uuid) {
       subtitle: item.subtitle || null,
       category: item.category || null,
       note: item.note || null,
-      fields: fields.map((f) => ({
-        label: f.label,
-        type: f.type,
-        value: f.value,
-        sensitive: f.sensitive === 1 || f.sensitive === true,
-      })),
+      fields: fields.map((f) => resolveField(f, itemKey, item.uuid)),
       attachments: attachmentMeta(db, uuid),
     };
   });
@@ -329,95 +348,21 @@ function readExternalAttachment(vaultPath, attachmentId, keyBlob) {
   throw new Error(`Failed to read external attachment (${lastError ? lastError.message : "unknown error"}).`);
 }
 
-// Backs up the vault file, then inserts a new entry. Enpass picks up the new
-// entry on its next sync. The backup protects against schema surprises.
-export function createItem(session, data) {
-  const backupPath = backupVault(session.path);
-  const uuid = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
-  const category = data.category || "login";
-
-  withConnection(session, false, (db) => {
-    const itemCols = tableInfo(db, "item");
-    const fieldCols = tableInfo(db, "itemfield");
-
-    const insertItemAndFields = db.transaction(() => {
-      insertRow(db, "item", {
-        uuid,
-        title: data.title,
-        subtitle: data.username || "",
-        category,
-        template_type: `${category}.default`,
-        note: data.note || "",
-        created_at: now,
-        updated_at: now,
-        meta_updated_at: now,
-        favorite: 0,
-        archived: 0,
-        trashed: 0,
-        deleted: 0,
-      }, itemCols);
-
-      const fields = [];
-      if (data.username) fields.push({ label: "Username", type: "username", value: data.username, sensitive: 0 });
-      if (data.password) fields.push({ label: "Password", type: "password", value: data.password, sensitive: 1 });
-      if (data.url) fields.push({ label: "Website", type: "url", value: data.url, sensitive: 0 });
-      for (const extra of data.fields || []) {
-        fields.push({
-          label: extra.label,
-          type: extra.type || "text",
-          value: extra.value,
-          sensitive: extra.sensitive ? 1 : 0,
-        });
-      }
-
-      let order = 1;
-      for (const field of fields) {
-        insertRow(db, "itemfield", {
-          uuid: crypto.randomUUID(),
-          item_uuid: uuid,
-          label: field.label,
-          type: field.type,
-          value: field.value,
-          sensitive: field.sensitive,
-          order: order++,
-          deleted: 0,
-          updated_at: now,
-          value_updated_at: now,
-          hash: crypto.createHash("sha1").update(String(field.value)).digest("hex"),
-        }, fieldCols);
-      }
-    });
-    insertItemAndFields();
-  });
-
-  return { uuid, backupPath };
-}
-
-function insertRow(db, table, values, columnInfo) {
-  const names = new Set(columnInfo.map((c) => c.name));
-  const row = {};
-  for (const [key, value] of Object.entries(values)) {
-    if (names.has(key)) row[key] = value;
-  }
-  // Fill any NOT NULL column without a default that we did not set, so the insert
-  // does not fail on Enpass schema versions with extra required columns.
-  for (const col of columnInfo) {
-    if (col.notnull === 1 && col.dflt_value === null && col.pk === 0 && !(col.name in row)) {
-      row[col.name] = zeroValueForType(col.type);
-    }
-  }
-  const cols = Object.keys(row);
-  if (cols.length === 0) throw new Error(`No matching columns for table ${table}`);
-  const placeholders = cols.map(() => "?").join(", ");
-  const quoted = cols.map((c) => `"${c}"`).join(", ");
-  const params = cols.map((c) => row[c]);
-  db.prepare(`INSERT INTO ${table} (${quoted}) VALUES (${placeholders})`).run(params);
-}
-
-export function backupVault(vaultPath) {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupPath = `${vaultPath}.backup-${stamp}`;
-  fs.copyFileSync(vaultPath, backupPath);
-  return backupPath;
+// Writing is DISABLED — this MCP is read-only.
+//
+// Inserting an entry directly into the SQLCipher database corrupts recent Enpass
+// vaults: Enpass crashes on load. This was verified end to end against a real
+// vault (schema version 6, per-item `item.key`, itemfield.algo_version = 1).
+// Sensitive field values are encrypted with an undocumented per-item key we cannot
+// reproduce, and even a fully structured, NON-sensitive-only entry (correct
+// template / orde / item_field_uid / icon, no sensitive fields, no per-item key)
+// still crashes the app, so Enpass rejects externally inserted items at a level
+// below the field encryption. Reproducing Enpass's item-acceptance model from
+// outside the app is not feasible. To add entries, use the Enpass app itself.
+export function createItem() {
+  throw new Error(
+    "Writing is disabled: inserting entries directly into the Enpass database " +
+      "corrupts recent vaults and crashes Enpass. This MCP is read-only, add " +
+      "entries in the Enpass app.",
+  );
 }

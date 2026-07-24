@@ -15,7 +15,6 @@ import {
   unlockParameters,
   listItems,
   getItem,
-  createItem,
   listAttachments,
   readAttachment,
 } from "./vault.js";
@@ -23,6 +22,15 @@ import { computeOtp, isOtpValue } from "./otp.js";
 
 function findOtpField(item) {
   return item.fields.find((f) => f.type === "totp" || isOtpValue(f.value));
+}
+
+// First field of one of the given types that actually holds a value. Entries often
+// carry an empty built-in field (an unused "password" slot on a login that keeps its
+// real credentials in labelled custom fields), and picking that empty one first would
+// report the entry as having no password at all.
+function firstValue(item, types) {
+  const found = item.fields.find((f) => types.includes(f.type) && f.value);
+  return found ? found.value : null;
 }
 
 // Unlocked sessions: vault name -> { path, hexKey, compat }. The derived key
@@ -181,14 +189,13 @@ export function createServer() {
         const session = requireSession(vault);
         const item = await getItem(session, uuid);
         if (!item) return fail(`Entry "${uuid}" not found in vault "${vault}".`);
-        const password = item.fields.find((f) => f.type === "password");
         const otpField = findOtpField(item);
         const otp = otpField ? computeOtp(otpField.value) : null;
         return json({
           uuid: item.uuid,
           title: item.title,
-          username: item.fields.find((f) => f.type === "username" || f.type === "email")?.value || null,
-          password: password ? password.value : null,
+          username: firstValue(item, ["username", "email"]),
+          password: firstValue(item, ["password"]),
           otp: otp ? otp.code : null,
           otp_seconds_remaining: otp ? otp.secondsRemaining : null,
         });
@@ -297,43 +304,9 @@ export function createServer() {
     },
   );
 
-  server.registerTool(
-    "create_item",
-    {
-      title: "Create entry",
-      description:
-        "Creates a new entry in an unlocked vault. The vault file is backed up automatically before writing. Enpass picks up the new entry on its next sync.",
-      inputSchema: {
-        vault: z.string().describe("Registered vault name"),
-        title: z.string().describe("Entry title"),
-        password: z.string().optional().describe("Password value"),
-        username: z.string().optional().describe("Username or email"),
-        url: z.string().optional().describe("Website URL"),
-        note: z.string().optional().describe("Free-text note"),
-        category: z.string().optional().describe("Category, defaults to 'login'"),
-        fields: z
-          .array(
-            z.object({
-              label: z.string(),
-              value: z.string(),
-              type: z.string().optional(),
-              sensitive: z.boolean().optional(),
-            }),
-          )
-          .optional()
-          .describe("Additional custom fields"),
-      },
-    },
-    async ({ vault, title, password, username, url, note, category, fields }) => {
-      try {
-        const session = requireSession(vault);
-        const result = await createItem(session, { title, password, username, url, note, category, fields });
-        return json({ created: true, vault, uuid: result.uuid, backup: result.backupPath });
-      } catch (err) {
-        return fail(err.message);
-      }
-    },
-  );
+  // Writing is intentionally NOT exposed. Inserting entries directly into the
+  // SQLCipher database corrupts recent Enpass vaults and crashes the app (verified
+  // end to end). This MCP is read-only; entries are added in the Enpass app.
 
   return server;
 }
