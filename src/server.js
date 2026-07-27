@@ -10,6 +10,7 @@ import {
   listVaults as listRegisteredVaults,
   getVault,
   getSecret,
+  writesEnabled,
 } from "./config.js";
 import {
   unlockParameters,
@@ -19,6 +20,10 @@ import {
   readAttachment,
 } from "./vault.js";
 import { computeOtp, isOtpValue } from "./otp.js";
+import { execFileSync } from "node:child_process";
+import Database from "better-sqlite3-multiple-ciphers";
+import { insertItem, deleteItem, finalizeVault, pushSync, pullSync } from "./write.js";
+import { discoverSyncedVaults, syncTargetFor, remoteStatus } from "./foldersync.js";
 
 function findOtpField(item) {
   return item.fields.find((f) => f.type === "totp" || isOtpValue(f.value));
@@ -57,7 +62,7 @@ function fail(message) {
 }
 
 export function createServer() {
-  const server = new McpServer({ name: "enpass-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "enpass-mcp", version: "0.2.0" });
 
   server.registerTool(
     "list_vaults",
@@ -304,9 +309,196 @@ export function createServer() {
     },
   );
 
-  // Writing is intentionally NOT exposed. Inserting entries directly into the
-  // SQLCipher database corrupts recent Enpass vaults and crashes the app (verified
-  // end to end). This MCP is read-only; entries are added in the Enpass app.
+  // --- writing -------------------------------------------------------------
+  //
+  // Writing WAS disabled here with the note that inserting entries corrupts recent
+  // vaults. That diagnosis was wrong: the crash came from NULL columns, an incomplete
+  // template field set and a stale sync state, not from Enpass rejecting outside writes.
+  // See src/write.js. Verified end to end on 2026-07-26: written, deleted, synced both
+  // ways, Enpass opens without a crash.
+  //
+  // Enpass MUST be closed while writing, it caches the database in memory and would
+  // overwrite anything written underneath it. Every writing tool refuses otherwise.
+
+  const enpassRunning = () => {
+    try {
+      return execFileSync("/usr/bin/pgrep", ["-x", "Enpass"], { encoding: "utf8" }).trim().length > 0;
+    } catch {
+      return false; // pgrep exits non-zero when nothing matches
+    }
+  };
+  const requireClosed = () =>
+    enpassRunning()
+      ? fail("Enpass is running. Quit it before writing, otherwise it overwrites the change from its cache.")
+      : null;
+
+  // Opens the vault read-write using the session key from unlock_vault.
+  const openWritable = (vault) => {
+    const session = sessions.get(vault);
+    if (!session) throw new Error(`Vault "${vault}" is locked. Call unlock_vault first.`);
+    const db = new Database(session.path, { fileMustExist: true });
+    db.pragma("cipher='sqlcipher'");
+    db.pragma(`legacy=${session.compat}`);
+    db.pragma(`key="x'${session.hexKey}'"`);
+    return { db, dbPath: session.path };
+  };
+
+  // After any write: republish through folder sync, but ONLY for vaults that actually
+  // use it. Vaults on iCloud/Dropbox/WebDAV or without sync are left alone.
+  const publish = (dbPath, vaultUuid) => {
+    const target = vaultUuid ? syncTargetFor(vaultUuid) : null;
+    if (!target) return { synced: false, reason: "no folder sync for this vault" };
+    const res = pushSync(target.vaultDir, target.syncDir, target.remoteDir);
+    const meta = new Database(path.join(target.syncDir, "syncmeta.db"), { fileMustExist: true });
+    const set = meta.prepare("INSERT INTO main(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+    set.run("revision", String(res.now));
+    set.run("sync_last_done_time", String(res.now));
+    set.run("sync_vault_dirty", "0");
+    meta.close();
+    return { synced: true, targets: res.written, revision: res.now };
+  };
+
+  const vaultUuidOf = (dbPath) => path.basename(path.dirname(dbPath));
+
+  // Everything past this point can change the vault, so it is only advertised when the
+  // user opted in. Read-only stays the default: an agent that is not supposed to edit
+  // the vault should not even see that these tools exist.
+  const allowWrites = writesEnabled();
+
+  if (allowWrites) {
+  server.registerTool(
+    "create_item",
+    {
+      title: "Create item",
+      description:
+        "Creates a login entry in an unlocked vault and publishes it through Enpass folder sync when that vault uses it. Supports arbitrary custom fields (e.g. SMTP host, port), sensitive ones are encrypted like Enpass does. Enpass must be closed.",
+      inputSchema: {
+        vault: z.string().describe("Registered vault name"),
+        title: z.string(),
+        username: z.string().optional(),
+        email: z.string().optional(),
+        password: z.string().optional(),
+        url: z.string().optional(),
+        note: z.string().optional(),
+        subtitle: z.string().optional(),
+        custom: z
+          .array(z.object({ label: z.string(), value: z.string(), sensitive: z.boolean().optional() }))
+          .optional()
+          .describe("Extra fields beyond the template, e.g. [{label:'SMTP Port', value:'587'}]"),
+      },
+    },
+    async ({ vault, title, username, email, password, url, note, subtitle, custom }) => {
+      const blocked = requireClosed();
+      if (blocked) return blocked;
+      try {
+        const { db, dbPath } = openWritable(vault);
+        let uuid;
+        db.transaction(() => {
+          uuid = insertItem(db, {
+            title,
+            subtitle: subtitle ?? "",
+            note: note ?? "",
+            values: { username, email, password, url },
+            custom: custom ?? [],
+          });
+        })();
+        const counts = finalizeVault(db, dbPath);
+        db.close();
+        return json({ created: uuid, title, items: counts.items, sync: publish(dbPath, vaultUuidOf(dbPath)) });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_item",
+    {
+      title: "Delete item",
+      description:
+        "Deletes an entry the way Enpass does: the row stays as a tombstone with deleted=1 so the other machine learns about the deletion instead of resurrecting the entry. Publishes through folder sync. Enpass must be closed.",
+      inputSchema: {
+        vault: z.string(),
+        uuid: z.string().optional().describe("Item uuid; alternatively pass title"),
+        title: z.string().optional().describe("Exact title, used when uuid is omitted"),
+        toTrash: z.boolean().optional().describe("Move to trash instead of deleting permanently"),
+      },
+    },
+    async ({ vault, uuid, title, toTrash }) => {
+      const blocked = requireClosed();
+      if (blocked) return blocked;
+      try {
+        const { db, dbPath } = openWritable(vault);
+        let target = uuid;
+        if (!target) {
+          if (!title) { db.close(); return fail("Pass either uuid or title."); }
+          const row = db.prepare("SELECT uuid FROM item WHERE title=? AND deleted=0").get(title);
+          if (!row) { db.close(); return fail(`No active entry titled "${title}".`); }
+          target = row.uuid;
+        }
+        let res;
+        db.transaction(() => { res = deleteItem(db, target, { toTrash: !!toTrash }); })();
+        const counts = finalizeVault(db, dbPath);
+        db.close();
+        return json({ deleted: res.uuid, mode: res.mode, items: counts.items, sync: publish(dbPath, vaultUuidOf(dbPath)) });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+  }
+
+  server.registerTool(
+    "sync_status",
+    {
+      title: "Sync status",
+      description:
+        "Lists every vault that uses Enpass folder sync, where its sync folder is, and whether the copy there is newer than the local one. Vaults without folder sync are not listed. Answers include a reason, so 'no baseline yet' is distinguishable from 'up to date'.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const vaults = discoverSyncedVaults().map((v) => {
+          const st = remoteStatus(v, Database);
+          return { vault: v.name, uuid: v.uuid, syncFolder: v.remoteDir, remoteIsNewer: st.newer, reason: st.reason };
+        });
+        return json({ vaults, count: vaults.length });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+
+  // sync_pull replaces the local vault file with the copy from the sync folder, so it
+  // counts as writing even though nothing inside the database is edited.
+  if (allowWrites) {
+  server.registerTool(
+    "sync_pull",
+    {
+      title: "Pull newer copy",
+      description:
+        "Takes in the copy from the sync folder when it is genuinely newer, after backing up the local vault (one generation, under .enpass-mcp-previous). Does nothing when there is no baseline or no folder sync. Enpass must be closed.",
+      inputSchema: {
+        vaultUuid: z.string().describe("Vault uuid as reported by sync_status"),
+        force: z.boolean().optional().describe("Pull even when the local copy looks current"),
+      },
+    },
+    async ({ vaultUuid, force }) => {
+      const blocked = requireClosed();
+      if (blocked) return blocked;
+      try {
+        const target = syncTargetFor(vaultUuid);
+        if (!target) return fail(`No folder sync configured for vault ${vaultUuid}.`);
+        const st = remoteStatus(target, Database);
+        if (!st.newer && !force) return json({ pulled: false, reason: st.reason });
+        const res = pullSync(target.vaultDir, target.syncDir, target.remoteDir, Database);
+        return json({ pulled: true, vault: res.vaultName, items: res.items, revision: res.stamp, backup: ".enpass-mcp-previous" });
+      } catch (err) {
+        return fail(err.message);
+      }
+    },
+  );
+  }
 
   return server;
 }

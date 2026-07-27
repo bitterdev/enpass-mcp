@@ -11,10 +11,10 @@ import {
   unlockParameters,
   listItems,
   getItem,
-  createItem,
   listAttachments,
   readAttachment,
 } from "../src/vault.js";
+import { createServer } from "../src/server.js";
 import { computeOtp } from "../src/otp.js";
 
 // The fixtures are genuine SQLCipher databases in the Enpass vault format
@@ -177,16 +177,46 @@ test("external attachments also work on compat-3 vaults", () => {
   assert.equal(external.buffer.length, 4096);
 });
 
-test("create_item is disabled: writing throws and mutates nothing", () => {
-  // Direct writes corrupt recent Enpass vaults and crash the app, so the MCP is
-  // read-only. createItem must refuse and leave the vault untouched.
-  const vaultPath = tempVault("fixture-v4.enpassdb");
-  const { session } = unlock(vaultPath);
-  const before = listItems(session, {}).length;
+// --- the write switch ---
 
-  assert.throws(() => createItem(session, { title: "GitLab" }), /disabled/i);
+const WRITING_TOOLS = ["create_item", "delete_item", "sync_pull"];
 
-  assert.equal(listItems(session, {}).length, before);
+function toolNames() {
+  return Object.keys(createServer()._registeredTools ?? {});
+}
+
+function withAllowWrites(value, fn) {
+  const previous = process.env.ENPASS_MCP_ALLOW_WRITES;
+  if (value === undefined) delete process.env.ENPASS_MCP_ALLOW_WRITES;
+  else process.env.ENPASS_MCP_ALLOW_WRITES = value;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.ENPASS_MCP_ALLOW_WRITES;
+    else process.env.ENPASS_MCP_ALLOW_WRITES = previous;
+  }
+}
+
+test("without the switch the writing tools are not advertised at all", () => {
+  const names = withAllowWrites(undefined, toolNames);
+  for (const tool of WRITING_TOOLS) assert.ok(!names.includes(tool), `${tool} must stay hidden`);
+  assert.ok(names.includes("get_password"), "reading stays available");
+});
+
+test("ENPASS_MCP_ALLOW_WRITES turns the writing tools on", () => {
+  const names = withAllowWrites("1", toolNames);
+  for (const tool of WRITING_TOOLS) assert.ok(names.includes(tool), `${tool} must be offered`);
+});
+
+test("only an explicit yes counts as enabled", () => {
+  for (const value of ["", "0", "false", "no", "maybe"]) {
+    const names = withAllowWrites(value, toolNames);
+    assert.ok(!names.includes("create_item"), `"${value}" must not enable writing`);
+  }
+  for (const value of ["1", "true", "yes", "on", "TRUE", " Yes "]) {
+    const names = withAllowWrites(value, toolNames);
+    assert.ok(names.includes("create_item"), `"${value}" must enable writing`);
+  }
 });
 
 // --- per-item field encryption (itemfield.algo_version = 1) ---

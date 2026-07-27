@@ -164,6 +164,17 @@ export function getSecret(name) {
   return process.env[`ENPASS_MASTER_PASSWORD_${name.toUpperCase()}`] || process.env.ENPASS_MASTER_PASSWORD || null;
 }
 
+// --- capability switch ---
+
+// Writing into a vault is opt-in. A password manager is the last place where a
+// tool should be able to change data because a model decided to, so the server
+// starts read-only and only advertises the writing tools when the user turns
+// them on with ENPASS_MCP_ALLOW_WRITES=1 (env or the config .env).
+export function writesEnabled() {
+  const raw = (process.env.ENPASS_MCP_ALLOW_WRITES || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 export function hasSecret(name) {
   return getSecret(name) !== null;
 }

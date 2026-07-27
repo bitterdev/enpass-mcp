@@ -347,22 +347,3 @@ function readExternalAttachment(vaultPath, attachmentId, keyBlob) {
   }
   throw new Error(`Failed to read external attachment (${lastError ? lastError.message : "unknown error"}).`);
 }
-
-// Writing is DISABLED — this MCP is read-only.
-//
-// Inserting an entry directly into the SQLCipher database corrupts recent Enpass
-// vaults: Enpass crashes on load. This was verified end to end against a real
-// vault (schema version 6, per-item `item.key`, itemfield.algo_version = 1).
-// Sensitive field values are encrypted with an undocumented per-item key we cannot
-// reproduce, and even a fully structured, NON-sensitive-only entry (correct
-// template / orde / item_field_uid / icon, no sensitive fields, no per-item key)
-// still crashes the app, so Enpass rejects externally inserted items at a level
-// below the field encryption. Reproducing Enpass's item-acceptance model from
-// outside the app is not feasible. To add entries, use the Enpass app itself.
-export function createItem() {
-  throw new Error(
-    "Writing is disabled: inserting entries directly into the Enpass database " +
-      "corrupts recent vaults and crashes Enpass. This MCP is read-only, add " +
-      "entries in the Enpass app.",
-  );
-}

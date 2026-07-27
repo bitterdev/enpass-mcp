@@ -2,8 +2,8 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives
 an AI assistant controlled, local access to your [Enpass](https://www.enpass.io)
-password vaults: unlock a vault, list vaults, list and read entries, and create new
-entries.
+password vaults: unlock a vault, list vaults, and list and read entries. Creating and
+deleting entries is possible too, but switched off until you enable it.
 
 Runs locally over stdio. Your Enpass vault never leaves your machine, and your
 **master password never passes through the model**: it is stored in your operating
@@ -20,9 +20,9 @@ system's keychain and read directly by the server.
   directly with SQLCipher. Nothing is uploaded anywhere.
 - **Reads are explicit.** Listing entries never returns passwords. Secrets are only
   returned by `get_item` / `get_password`, when you explicitly ask for them.
-- **Read-only.** The server never modifies the vault. Writing entries directly into
-  the SQLCipher database corrupts recent Enpass vaults and crashes the app, so
-  creating entries is left to the Enpass app itself.
+- **Read-only unless you say otherwise.** Out of the box the server cannot change
+  anything: the writing tools are not even advertised. Set
+  `ENPASS_MCP_ALLOW_WRITES=1` to enable them (see [Writing](#writing-opt-in)).
 
 Entry passwords are, by design, returned to the assistant when you ask for them, so
 only connect this to an assistant and vaults you trust.
@@ -128,9 +128,15 @@ claude mcp add enpass -- enpass-mcp serve
 | `get_otp` | Generate the current TOTP / 2FA one-time code for an entry, with seconds until it rotates. |
 | `list_attachments` | List an entry's file attachments (name, size, MIME). |
 | `export_attachment` | Decrypt an attachment; writes it to disk and returns the path (or base64 inline for small files). |
+| `sync_status` | List the vaults that use Enpass folder sync and whether the copy in the sync folder is newer. |
 
-The server is **read-only**: there is no tool to create or modify entries (see
-[Why there is no write support](#why-there-is-no-write-support)).
+With `ENPASS_MCP_ALLOW_WRITES=1` three more tools appear (see [Writing](#writing-opt-in)):
+
+| Tool | Description |
+| --- | --- |
+| `create_item` | Create an entry, including custom fields; sensitive values are encrypted the way Enpass does it. |
+| `delete_item` | Delete an entry, or move it to the trash, leaving the tombstone Enpass uses so the deletion syncs. |
+| `sync_pull` | Take in a newer copy from the sync folder, after backing up the local vault. |
 
 `list_items` / `get_item` work for **every** Enpass entry type (logins, credit
 cards, secure notes, identities, etc.), not just logins, and return all fields.
@@ -196,14 +202,43 @@ External-attachment handling is implemented from Enpass's documented format. If 
 a vault whose attachments do not decrypt, please open an issue with the (non-secret)
 schema of your `attachment` table.
 
-## Why there is no write support
+## Writing (opt-in)
 
-This MCP is read-only by design. Recent Enpass vaults (schema version 6) do not
-tolerate entries inserted directly into the SQLCipher database: Enpass crashes when it
-loads such a vault. Even a fully structured, **non-sensitive-only** entry (correct
-`template`, `orde`, `item_field_uid`, `icon`, no sensitive fields) still crashes the
-app, so Enpass rejects externally inserted items regardless of field encryption. This
-was verified end to end against a real vault. To add entries, use the Enpass app itself.
+Writing is switched off by default. A password vault is the last place where a tool
+should be able to change data just because a model decided to, so the server starts
+read-only and does not even list `create_item`, `delete_item` and `sync_pull` until you
+turn them on:
+
+```bash
+ENPASS_MCP_ALLOW_WRITES=1
+```
+
+Set it in the server's environment (in your MCP client config, or in the `.env` next to
+`vaults.json`). Nothing else changes: reading works exactly the same either way.
+
+**Enpass must be closed while writing.** The app keeps the database in memory and would
+write its own cached copy back over any change made underneath it. Every writing tool
+refuses to run while Enpass is open.
+
+Earlier versions of this README claimed writing was impossible because recent vaults
+(schema version 6) crash Enpass when entries are inserted directly. The crash was real,
+the diagnosis was wrong. Three concrete rules make it work, all of them derived from
+what Enpass itself writes:
+
+1. **Enpass never stores `NULL`.** The crash is `EXC_BAD_ACCESS` in `strlen` on a null
+   pointer: a column omitted from the `INSERT` defaults to `NULL`, and the app calls
+   `strlen` on it. Every column is written explicitly, empty strings instead of `NULL`.
+2. **A template has a fixed field set.** `login.default` always carries the same nine
+   fields, in the same order, with the same field uids, even when most are empty.
+   Writing only the fields you happen to have a value for produces an entry the app
+   cannot render.
+3. **The per-item key is reproducible.** `item.key` is a 32-byte AES-256 key plus a
+   12-byte GCM nonce, stored as `hex(ciphertext || tag)` with the item UUID as
+   additional authenticated data. Nothing in it is tied to Enpass internals, so a fresh
+   random key per item is fine.
+
+Verified end to end against a real vault: written, read back, decrypted to the original,
+deleted, synced in both directions, and Enpass opens the vault without crashing.
 
 ## Configuration
 
@@ -215,6 +250,15 @@ is stored in a small `vaults.json`:
 - Linux: `~/.config/enpass-mcp/vaults.json`
 
 Override the directory with `ENPASS_MCP_CONFIG_DIR`.
+
+Environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `ENPASS_MCP_ALLOW_WRITES` | `1`, `true`, `yes` or `on` enables the writing tools. Anything else, including unset, keeps the server read-only. |
+| `ENPASS_MCP_CONFIG_DIR` | Where `vaults.json` and the optional `.env` live. |
+| `ENPASS_MASTER_PASSWORD` | Optional fallback master password for vaults without a keychain entry. Prefer the keychain. |
+| `ENPASS_MASTER_PASSWORD_<VAULT>` | Same, for one specific vault. |
 
 ## Development
 
