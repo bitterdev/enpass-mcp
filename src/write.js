@@ -27,6 +27,7 @@
 // vault.json next to the database carries vault_items_count / vault_att_count /
 // last_modified_time and is updated too, so the counters stay consistent with the data.
 import crypto from "node:crypto";
+import Database from "better-sqlite3-multiple-ciphers";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -204,6 +205,144 @@ import { backupVault } from "./foldersync.js";
 
 export const SYNC_HEADER_SIZE = 1024;
 
+// Attachments do NOT travel inside the container. Enpass keeps every file larger than a
+// kilobyte in its own "<attachment uuid>.enpassattach" database and drops those files
+// into the sync folder next to the container, verified on the real sync folders: the
+// container is always exactly the vault database plus the 1024-byte header, while the
+// .enpassattach files sit beside it.
+//
+// That makes the two sync directions dangerous for attachments if they only move the
+// database: a pull would install rows pointing at files that never arrived, and a push
+// would publish rows the other machine cannot resolve. Both look exactly like "the
+// attachments are broken" while every byte in the vault is fine.
+//
+// Only MISSING files are copied, in both directions. An .enpassattach file is named
+// after the attachment uuid and is never rewritten in place (editing an attachment
+// creates a new uuid), so filling gaps is safe and overwriting would not be.
+function copyMissingAttachments(fromDir, toDir) {
+  if (!fs.existsSync(fromDir) || !fs.existsSync(toDir)) return [];
+  const copied = [];
+  for (const name of fs.readdirSync(fromDir)) {
+    if (!name.endsWith(".enpassattach")) continue;
+    const dest = path.join(toDir, name);
+    if (fs.existsSync(dest)) continue;
+    fs.copyFileSync(path.join(fromDir, name), dest);
+    copied.push(name);
+  }
+  return copied;
+}
+
+// --- writing attachments ---------------------------------------------------
+//
+// Enpass stores an attachment's bytes RAW inside its own encrypted database, one row,
+// and keeps the key for that file as a finished SQLCipher key expression in the vault's
+// attachment.password column. Two mistakes were made here before and both look like a
+// corrupted file to the user, so they are spelled out:
+//
+//   1. Storing a data-URI ("data:;base64,<payload>") instead of the bytes. Enpass hands
+//      such a payload out verbatim, so every export is a text file with a .pdf name.
+//      On 2026-07-30 that affected 74 attachments across the vaults and had to be
+//      repaired with scripts/repair-data-uri-attachments.mjs.
+//   2. Hex-encoding the key expression again. It is already ASCII and must be passed
+//      through unchanged, otherwise SQLCipher answers "file is not a database".
+//
+// The reference shape was taken from a working attachment: inner table
+// attachment(ID PRIMARY KEY CHECK (ID=1), uuid TEXT UNIQUE, data blob), cipher
+// compatibility 3, and a 48-byte random key rendered as x'<96 hex>'.
+const ATTACHMENT_KEY_BYTES = 48; // 32 byte key + 16 byte salt, as Enpass does it
+
+function attachmentKeyExpression() {
+  return `x'${crypto.randomBytes(ATTACHMENT_KEY_BYTES).toString("hex")}'`;
+}
+
+// Guesses the media type from the file name. Enpass fills this column, and a missing
+// value is what made the app fall back to handing out the raw payload.
+function mediaTypeFor(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  const types = {
+    pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+    gif: "image/gif", txt: "text/plain", json: "application/json", zip: "application/zip",
+    p12: "application/x-pkcs12", pfx: "application/x-pkcs12", pem: "application/x-pem-file",
+    cer: "application/x-x509-ca-cert", key: "application/octet-stream",
+  };
+  return types[ext] || "application/octet-stream";
+}
+
+// Writes one attachment for an existing item. `content` must be the RAW bytes; a
+// data-URI is rejected rather than stored, because storing it is exactly the bug above.
+export function addAttachment(db, vaultPath, itemUuid, name, content) {
+  if (!Buffer.isBuffer(content)) throw new Error("content must be a Buffer of raw bytes");
+  if (content.length === 0) throw new Error("refusing to store an empty attachment");
+  if (content.subarray(0, 5).toString("latin1") === "data:") {
+    throw new Error(
+      "content looks like a data-URI. Decode it first and pass the raw bytes, " +
+      "otherwise Enpass hands the text out as the file.");
+  }
+  const item = db.prepare("SELECT uuid FROM item WHERE uuid=? AND deleted=0").get(itemUuid);
+  if (!item) throw new Error(`No item with uuid ${itemUuid}`);
+
+  const uuid = crypto.randomUUID();
+  const keyExpression = attachmentKeyExpression();
+  const file = path.join(path.dirname(vaultPath), `${uuid}.enpassattach`);
+  if (fs.existsSync(file)) throw new Error(`attachment file already exists: ${file}`);
+
+  // The inner database mirrors the structure Enpass itself creates.
+  const inner = new Database(file);
+  try {
+    inner.pragma("cipher='sqlcipher'");
+    inner.pragma("legacy=3");
+    inner.pragma(`key="${keyExpression}"`);
+    inner.exec(
+      "CREATE TABLE attachment(ID INTEGER PRIMARY KEY AUTOINCREMENT CHECK (ID=1)," +
+      "uuid TEXT UNIQUE NOT NULL,data blob,UNIQUE (uuid) ON CONFLICT REPLACE)");
+    inner.prepare("INSERT INTO attachment (ID,uuid,data) VALUES (1,?,?)").run(uuid, content);
+  } catch (err) {
+    inner.close();
+    fs.rmSync(file, { force: true });
+    throw err;
+  }
+  inner.close();
+
+  // The column set of `attachment` differs between vault generations (older ones have
+  // no `orde`, `internal` or `extra`, and carry a `kind` instead). So the row is built
+  // from the columns this vault really has. Every one of them gets an explicit value:
+  // Enpass never stores NULL anywhere and crashes on a NULL it expected to be a string.
+  const now = Math.floor(Date.now() / 1000);
+  const available = new Set(db.prepare("PRAGMA table_info(attachment)").all().map((c) => c.name));
+  const candidates = {
+    uuid,
+    item_uuid: itemUuid,
+    name,
+    size: content.length,
+    mime: mediaTypeFor(name),
+    kind: mediaTypeFor(name),
+    updated_at: now,
+    created_at: now,
+    deleted: 0,
+    internal: 0,
+    extra: "",
+    password: Buffer.from(keyExpression, "latin1"),
+    data: Buffer.alloc(0),
+  };
+  if (available.has("orde")) {
+    candidates.orde = (db
+      .prepare("SELECT COALESCE(MAX(orde),0) o FROM attachment WHERE item_uuid=?")
+      .get(itemUuid).o) + 1;
+  }
+  const columns = Object.keys(candidates).filter((c) => available.has(c));
+  const missing = [...available].filter((c) => !columns.includes(c) && c !== "ID");
+  if (missing.length) {
+    throw new Error(
+      `Unknown columns in this vault's attachment table: ${missing.join(", ")}. ` +
+      "Refusing to insert a row with NULLs in them.");
+  }
+  db.prepare(
+    `INSERT INTO attachment (${columns.join(",")}) VALUES (${columns.map((c) => `@${c}`).join(",")})`,
+  ).run(Object.fromEntries(columns.map((c) => [c, candidates[c]])));
+
+  return { uuid, name, size: content.length, file };
+}
+
 export function buildSyncContainer(vaultJsonPath, vaultDbPath) {
   const meta = fs.readFileSync(vaultJsonPath);
   if (meta.length >= SYNC_HEADER_SIZE) throw new Error("vault.json larger than the sync header");
@@ -232,11 +371,17 @@ export function pushSync(vaultDir, syncDir, remoteDir) {
     fs.copyFileSync(vaultJson, path.join(syncDir, "folder.json"));
     written.push("lokale Sync-Kopie");
   }
+  let attachments = [];
   if (remoteDir && fs.existsSync(remoteDir)) {
     fs.writeFileSync(path.join(remoteDir, "vault.enpassdbsync"), container);
     written.push("Sync-Ordner");
+    attachments = copyMissingAttachments(vaultDir, remoteDir);
   }
-  return { now, written, size: container.length, sha256: createHash("sha256").update(container).digest("hex").slice(0, 16) };
+  return {
+    now, written, attachments,
+    size: container.length,
+    sha256: createHash("sha256").update(container).digest("hex").slice(0, 16),
+  };
 }
 
 /**
@@ -291,6 +436,8 @@ export function pullSync(vaultDir, syncDir, remoteDir, DatabaseCtor) {
 
   fs.writeFileSync(path.join(vaultDir, "vault.enpassdb"), payload);
   fs.writeFileSync(path.join(vaultDir, "vault.json"), metaText + "\n");
+  // The incoming database may reference attachments this machine has never seen.
+  const attachments = copyMissingAttachments(remoteDir, vaultDir);
 
   if (fs.existsSync(syncDir)) {
     fs.writeFileSync(path.join(syncDir, "folder.enpassdb"), payload);
@@ -303,5 +450,5 @@ export function pullSync(vaultDir, syncDir, remoteDir, DatabaseCtor) {
   // must agree on, otherwise the next comparison thinks we are ahead of the remote.
   const stamp = Math.floor(fs.statSync(remoteFile).mtimeMs / 1000);
   markSynced(path.join(syncDir, "syncmeta.db"), DatabaseCtor, stamp);
-  return { stamp, items: meta.vault_items_count, size: payload.length, vaultName: meta.vault_name };
+  return { stamp, items: meta.vault_items_count, size: payload.length, vaultName: meta.vault_name, attachments };
 }

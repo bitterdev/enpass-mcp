@@ -21,6 +21,25 @@ const ITERATIONS = 100000;
 const EXTERNAL_ATTACHMENT_ID = "att-ext-1";
 const EXTERNAL_PAYLOAD = Buffer.alloc(4096, 0xab); // > 1 KB, deterministic
 
+// A second external attachment in the exact shape a real Enpass vault uses, because the
+// simplified one above hid a bug that broke every attachment in production:
+//   - `attachment.password` holds the finished SQLCipher key EXPRESSION as ASCII,
+//     x'<64 hex key><32 hex salt>', not raw key bytes
+//   - the payload is a base64 data URI, not the file
+//   - the inner table is attachment(ID, uuid, data), not attachment_data(data)
+export const REALISTIC_ATTACHMENT_ID = "att-ext-2";
+export const REALISTIC_FILE_BYTES = Buffer.from("%PDF-1.4\nrealistic attachment payload\n%%EOF\n", "utf8");
+const REALISTIC_STORED = Buffer.from(
+  `data:application/pdf;base64,${REALISTIC_FILE_BYTES.toString("base64")}`,
+  "utf8",
+);
+// Same trap on the inline path: small attachments are data URIs too.
+export const INLINE_DATA_URI_FILE_BYTES = Buffer.from('{"kind":"inline data uri"}', "utf8");
+const INLINE_DATA_URI_STORED = Buffer.from(
+  `data:application/json;base64,${INLINE_DATA_URI_FILE_BYTES.toString("base64")}`,
+  "utf8",
+);
+
 const run = (db, sql) => new Promise((res, rej) => db.run(sql, (e) => (e ? rej(e) : res())));
 const runP = (db, sql, params) => new Promise((res, rej) => db.run(sql, params, (e) => (e ? rej(e) : res())));
 const get = (db, sql) => new Promise((res, rej) => db.get(sql, (e, r) => (e ? rej(e) : res(r))));
@@ -54,7 +73,7 @@ function encryptFieldValue(plaintext, itemKey, itemUuid) {
   return Buffer.concat([ct, cipher.getAuthTag()]).toString("hex");
 }
 
-async function seed(db, externalKeyHex) {
+async function seed(db, externalKeyHex, realisticKeyExpression) {
   await run(db, `CREATE TABLE item(uuid TEXT PRIMARY KEY,title TEXT,subtitle TEXT,category TEXT,note TEXT,template_type TEXT,created_at INTEGER,updated_at INTEGER,meta_updated_at INTEGER,favorite INTEGER,archived INTEGER,trashed INTEGER,deleted INTEGER,key BLOB)`);
   await run(db, `CREATE TABLE itemfield(uuid TEXT,item_uuid TEXT,label TEXT,type TEXT,value TEXT,sensitive INTEGER,"order" INTEGER,deleted INTEGER,updated_at INTEGER,value_updated_at INTEGER,hash TEXT,algo_version INTEGER)`);
   await run(db, `CREATE TABLE folder(uuid TEXT PRIMARY KEY,title TEXT,updated_at INTEGER,parent_uuid TEXT)`);
@@ -108,30 +127,38 @@ async function seed(db, externalKeyHex) {
   // in <uuid>.enpassattach encrypted with that key.
   await runP(db, `INSERT INTO attachment(uuid,item_uuid,name,size,mime,kind,password,data,deleted) VALUES(?,?,?,?,?,?,?,?,0)`,
     [EXTERNAL_ATTACHMENT_ID, "item-1", "photo.bin", EXTERNAL_PAYLOAD.length, "application/octet-stream", "external", Buffer.from(externalKeyHex, "hex"), null]);
+
+  // The two production shapes: key expression as text, payload as a data URI. `size`
+  // deliberately counts the STORED bytes, which is what Enpass records.
+  await runP(db, `INSERT INTO attachment(uuid,item_uuid,name,size,mime,kind,password,data,deleted) VALUES(?,?,?,?,?,?,?,?,0)`,
+    [REALISTIC_ATTACHMENT_ID, "item-1", "report.pdf", REALISTIC_STORED.length, null, "external",
+      Buffer.from(realisticKeyExpression, "utf8"), null]);
+  await runP(db, `INSERT INTO attachment(uuid,item_uuid,name,size,mime,kind,password,data,deleted) VALUES(?,?,?,?,?,?,?,?,0)`,
+    ["att-inline-2", "item-1", "config.json", INLINE_DATA_URI_STORED.length, null, "inline", null, INLINE_DATA_URI_STORED]);
 }
 
-async function buildV4(vaultPath, externalKeyHex) {
+async function buildV4(vaultPath, externalKeyHex, realisticKeyExpression) {
   fs.rmSync(vaultPath, { force: true });
   const db = new sqlite3.Database(vaultPath);
   await new Promise((r) => db.serialize(r));
   await run(db, `PRAGMA key='${MASTER}'`);
   await run(db, `PRAGMA cipher_compatibility=4`);
   await run(db, `PRAGMA kdf_iter=${ITERATIONS}`);
-  await seed(db, externalKeyHex);
+  await seed(db, externalKeyHex, realisticKeyExpression);
   await close(db);
 }
 
 // Enpass compat-3 vaults use SQLCipher-3 cipher settings but a SHA512-derived raw
 // key. Create with a temp raw key, then rekey to the Enpass-style key (real
 // SQLCipher preserves the header salt on rekey).
-async function buildV3(vaultPath, externalKeyHex) {
+async function buildV3(vaultPath, externalKeyHex, realisticKeyExpression) {
   fs.rmSync(vaultPath, { force: true });
   const temp = crypto.randomBytes(32).toString("hex");
   let db = new sqlite3.Database(vaultPath);
   await new Promise((r) => db.serialize(r));
   await run(db, `PRAGMA key="x'${temp}'"`);
   await run(db, `PRAGMA cipher_compatibility=3`);
-  await seed(db, externalKeyHex);
+  await seed(db, externalKeyHex, realisticKeyExpression);
   await close(db);
 
   const salt = fs.readFileSync(vaultPath).slice(0, 16);
@@ -153,6 +180,22 @@ async function buildExternalAttachment(filePath, keyHex, payload) {
   await run(db, `CREATE TABLE attachment_data(data BLOB)`);
   await runP(db, `INSERT INTO attachment_data(data) VALUES(?)`, [payload]);
   await close(db);
+}
+
+// Builds the realistic external attachment: cipher_compatibility 3 (what Enpass uses),
+// the real inner table layout, and a key expression that carries the file's own header
+// salt after it, exactly as the vault stores it.
+async function buildRealisticAttachment(filePath, keyHex) {
+  fs.rmSync(filePath, { force: true });
+  let db = new sqlite3.Database(filePath);
+  await new Promise((r) => db.serialize(r));
+  await run(db, `PRAGMA key="x'${keyHex}'"`);
+  await run(db, `PRAGMA cipher_compatibility=3`);
+  await run(db, `CREATE TABLE attachment(ID INTEGER PRIMARY KEY AUTOINCREMENT CHECK (ID=1),uuid TEXT UNIQUE NOT NULL,data blob,UNIQUE (uuid) ON CONFLICT REPLACE)`);
+  await runP(db, `INSERT INTO attachment(uuid,data) VALUES(?,?)`, [REALISTIC_ATTACHMENT_ID, REALISTIC_STORED]);
+  await close(db);
+  const salt = fs.readFileSync(filePath).subarray(0, 16).toString("hex");
+  return `x'${keyHex}${salt}'`;
 }
 
 async function verify(vaultPath, compat) {
@@ -177,15 +220,19 @@ async function main() {
   const v4 = path.join(outDir, "fixture-v4.enpassdb");
   const v3 = path.join(outDir, "fixture-v3.enpassdb");
   const ext = path.join(outDir, `${EXTERNAL_ATTACHMENT_ID}.enpassattach`);
+  const realistic = path.join(outDir, `${REALISTIC_ATTACHMENT_ID}.enpassattach`);
 
-  await buildV4(v4, externalKeyHex);
-  await buildV3(v3, externalKeyHex);
   await buildExternalAttachment(ext, externalKeyHex, EXTERNAL_PAYLOAD);
+  // The key expression can only be built once the file exists: it ends with its salt.
+  const realisticKeyExpression = await buildRealisticAttachment(realistic, crypto.randomBytes(32).toString("hex"));
+
+  await buildV4(v4, externalKeyHex, realisticKeyExpression);
+  await buildV3(v3, externalKeyHex, realisticKeyExpression);
 
   await verify(v4, 4);
   await verify(v3, 3);
 
-  process.stdout.write(`Fixtures written to ${outDir}:\n  ${path.basename(v4)}\n  ${path.basename(v3)}\n  ${path.basename(ext)}\n`);
+  process.stdout.write(`Fixtures written to ${outDir}:\n  ${path.basename(v4)}\n  ${path.basename(v3)}\n  ${path.basename(ext)}\n  ${path.basename(realistic)}\n`);
 }
 
 main().catch((err) => {

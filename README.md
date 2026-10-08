@@ -198,16 +198,32 @@ vault, each encrypted with its own key stored in the vault. `export_attachment` 
 both: it decrypts the file and, by default, writes it to disk and returns the path, so
 it works for files of any size without pushing binary data through the model.
 
-External-attachment handling is implemented from Enpass's documented format. If you hit
-a vault whose attachments do not decrypt, please open an issue with the (non-secret)
-schema of your `attachment` table.
+Two details of that format are easy to miss, and both were wrong here until they were
+measured against real vaults:
+
+* `attachment.password` is not a key blob. It holds the finished SQLCipher raw-key
+  expression as text, `x'<64 hex key chars><32 hex salt chars>'`, and has to be passed
+  through verbatim. Hex-encoding it produces a key SQLCipher rejects, and every external
+  attachment then fails with "file is not a database".
+* The stored payload is frequently a base64 data URI (`data:application/pdf;base64,...`)
+  rather than the file itself, so it has to be decoded. Writing those bytes straight to
+  disk yields a text file with a `.pdf` name. `attachment.size` counts the stored bytes,
+  which is why it is larger than the exported file for anything wrapped this way.
+
+If you hit a vault whose attachments still do not decrypt, please open an issue with the
+(non-secret) schema of your `attachment` table.
+
+Attachments also do not travel inside the folder-sync container: Enpass drops the
+`.enpassattach` files into the sync folder next to it. `sync_pull` fetches the ones this
+machine is missing, and publishing a write copies local ones the sync folder lacks.
+Existing files are never overwritten or removed in either direction.
 
 ## Writing (opt-in)
 
 Writing is switched off by default. A password vault is the last place where a tool
 should be able to change data just because a model decided to, so the server starts
-read-only and does not even list `create_item`, `delete_item` and `sync_pull` until you
-turn them on:
+read-only and does not even list `create_item`, `delete_item`, `add_attachment` and
+`sync_pull` until you turn them on:
 
 ```bash
 ENPASS_MCP_ALLOW_WRITES=1
@@ -239,6 +255,38 @@ what Enpass itself writes:
 
 Verified end to end against a real vault: written, read back, decrypted to the original,
 deleted, synced in both directions, and Enpass opens the vault without crashing.
+
+### Attaching files
+
+`add_attachment` takes a **path**, never base64 in the argument list, and stores the bytes
+raw in the attachment's own encrypted database. Two rules come out of the same format
+details as reading, and getting either wrong looks exactly like a corrupted file while
+every byte in the vault is intact:
+
+* Store the **raw bytes**, not a data URI. A payload of `data:;base64,...` is handed out
+  verbatim by the Enpass app, so the export is a text file with a `.pdf` or `.jpeg` name.
+  `add_attachment` rejects such input instead of storing it.
+* Pass the key expression through unchanged. It is already the ASCII SQLCipher raw-key
+  expression; hex-encoding it again produces "file is not a database".
+
+The row is built from the columns the vault's `attachment` table actually has, because the
+column set differs between vault generations, and every column gets an explicit value so
+no `NULL` reaches Enpass.
+
+Regression guard: `npm test` writes a payload containing `0x00` and invalid UTF-8
+sequences, reads it back, and asserts the bytes are identical and stored unencoded.
+
+### Repairing attachments that were stored as a data URI
+
+`scripts/repair-data-uri-attachments.mjs` decodes such payloads back into raw bytes. It is
+a dry run unless `--apply` is given, refuses to run while Enpass is open, and checks the
+decoded payload against the file signature its name implies before writing.
+
+The bytes of an external attachment live in its own `.enpassattach` file, and folder sync
+keeps a **second copy** of every one of those files in the sync folder. Repairing the
+vault under the Enpass container therefore fixes one machine only. `--sync-folders`
+repairs the shared copies too, and only ever writes a payload that decodes byte for byte
+to what the local machine already holds.
 
 ## Configuration
 

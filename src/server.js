@@ -20,9 +20,10 @@ import {
   readAttachment,
 } from "./vault.js";
 import { computeOtp, isOtpValue } from "./otp.js";
+import { entryProblems } from "./hygiene.js";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3-multiple-ciphers";
-import { insertItem, deleteItem, finalizeVault, pushSync, pullSync } from "./write.js";
+import { insertItem, deleteItem, addAttachment, finalizeVault, pushSync, pullSync } from "./write.js";
 import { discoverSyncedVaults, syncTargetFor, remoteStatus } from "./foldersync.js";
 
 function findOtpField(item) {
@@ -355,7 +356,7 @@ export function createServer() {
     set.run("sync_last_done_time", String(res.now));
     set.run("sync_vault_dirty", "0");
     meta.close();
-    return { synced: true, targets: res.written, revision: res.now };
+    return { synced: true, targets: res.written, revision: res.now, attachmentsPublished: res.attachments };
   };
 
   const vaultUuidOf = (dbPath) => path.basename(path.dirname(dbPath));
@@ -390,6 +391,8 @@ export function createServer() {
     async ({ vault, title, username, email, password, url, note, subtitle, custom }) => {
       const blocked = requireClosed();
       if (blocked) return blocked;
+      const problems = entryProblems({ title, subtitle, note, custom });
+      if (problems.length) return fail(`entry refused: ${problems.join("; ")}`);
       try {
         const { db, dbPath } = openWritable(vault);
         let uuid;
@@ -446,6 +449,57 @@ export function createServer() {
       }
     },
   );
+
+  // The file itself is taken from a path, never from base64 in the argument list. Passing
+  // a document through the model as text is what produced the data-URI attachments that
+  // Enpass then handed out verbatim, so the bytes are read from disk and stored raw.
+  server.registerTool(
+    "add_attachment",
+    {
+      title: "Add attachment",
+      description:
+        "Attaches a file from disk to an existing entry and publishes it through Enpass folder sync. The bytes are stored raw, exactly as the Enpass app stores them, and read back byte for byte. Enpass must be closed.",
+      inputSchema: {
+        vault: z.string().describe("Registered vault name"),
+        uuid: z.string().optional().describe("Entry uuid; alternatively pass title"),
+        title: z.string().optional().describe("Exact entry title, used when uuid is omitted"),
+        file: z.string().describe("Absolute path of the file to attach"),
+        name: z.string().optional().describe("Name inside the vault (default: the file name)"),
+      },
+    },
+    async ({ vault, uuid, title, file, name }) => {
+      const blocked = requireClosed();
+      if (blocked) return blocked;
+      let db;
+      try {
+        if (!fs.existsSync(file)) return fail(`File not found: ${file}`);
+        const content = fs.readFileSync(file);
+        const opened = openWritable(vault);
+        db = opened.db;
+        const dbPath = opened.dbPath;
+        let target = uuid;
+        if (!target) {
+          if (!title) { db.close(); return fail("Pass either uuid or title."); }
+          const row = db.prepare("SELECT uuid FROM item WHERE title=? AND deleted=0").get(title);
+          if (!row) { db.close(); return fail(`No active entry titled "${title}".`); }
+          target = row.uuid;
+        }
+        const label = name || path.basename(file);
+        let res;
+        db.transaction(() => { res = addAttachment(db, dbPath, target, label, content); })();
+        const counts = finalizeVault(db, dbPath);
+        db.close();
+        db = null;
+        return json({
+          attached: res.name, uuid: res.uuid, size: res.size, item: target,
+          attachments: counts.atts, sync: publish(dbPath, vaultUuidOf(dbPath)),
+        });
+      } catch (err) {
+        db?.close();
+        return fail(err.message);
+      }
+    },
+  );
   }
 
   server.registerTool(
@@ -492,7 +546,10 @@ export function createServer() {
         const st = remoteStatus(target, Database);
         if (!st.newer && !force) return json({ pulled: false, reason: st.reason });
         const res = pullSync(target.vaultDir, target.syncDir, target.remoteDir, Database);
-        return json({ pulled: true, vault: res.vaultName, items: res.items, revision: res.stamp, backup: ".enpass-mcp-previous" });
+        return json({
+          pulled: true, vault: res.vaultName, items: res.items, revision: res.stamp,
+          attachmentsFetched: res.attachments, backup: ".enpass-mcp-previous",
+        });
       } catch (err) {
         return fail(err.message);
       }

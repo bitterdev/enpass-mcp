@@ -19,9 +19,12 @@
 // Same rules as write.js: never NULL, Enpass closed, caller owns finalizeVault and sync.
 import fs from "node:fs";
 import path from "node:path";
-import { deleteItem } from "./write.js";
+import crypto from "node:crypto";
+import { deleteItem, encryptFieldValue, ALGO_VERSION } from "./write.js";
 
 const TEMPLATE_URL_UID = 13;
+// The app numbers user-added fields from 1000 up, template fields stay below.
+const CUSTOM_FIELD_UID_MIN = 1000;
 
 function columns(db, table) {
   return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
@@ -32,9 +35,15 @@ function hasTable(db, name) {
 }
 
 /**
- * `changes`: { title?, subtitle?, note?, appendNote?, urls? }
+ * `changes`: { title?, subtitle?, note?, appendNote?, urls?, setFields?, addFields? }
  * `urls` is the complete list of url values the item should end up with, in order.
  * Existing url rows are reused (the template row first), surplus rows are marked deleted.
+ * `setFields`: [{ type, value }] rewrites the first active field of that type, e.g.
+ *   { type: "username", value: "" } so the e-mail shows as the login in the list.
+ *   Sensitive fields are encrypted with the item key like the app does.
+ * `addFields`: [{ label, value, sensitive?, type? }] appends custom fields.
+ * `removeFields`: [label] marks the active custom fields with that label deleted.
+ *   Template fields (uid below CUSTOM_FIELD_UID_MIN) are never touched.
  */
 export function editItem(db, uuid, changes) {
   const now = Math.floor(Date.now() / 1000);
@@ -91,7 +100,80 @@ export function editItem(db, uuid, changes) {
     }
     urlChange = { before: rows.map((r) => r.value), after: wanted, rewritten, removed };
   }
-  return { uuid, changed: Object.keys(set), urls: urlChange };
+  const fieldChanges = [];
+  if (Array.isArray(changes.removeFields) && changes.removeFields.length) {
+    // Older schemas lack item_field_uid; there the core template types are excluded instead.
+    const custom = columns(db, "itemfield").includes("item_field_uid")
+      ? `item_field_uid>=${CUSTOM_FIELD_UID_MIN}`
+      : "type NOT IN ('username','email','url','totp','phone','section')";
+    const find = db.prepare(`SELECT rowid AS rid FROM itemfield WHERE item_uuid=? AND label=? AND deleted=0 AND ${custom}`);
+    const drop = db.prepare("UPDATE itemfield SET deleted=1, updated_at=@now WHERE rowid=@rid");
+    for (const label of changes.removeFields) {
+      const rows = find.all(uuid, String(label));
+      if (!rows.length) throw new Error(`item ${uuid} has no active custom field "${label}"`);
+      rows.forEach((r) => drop.run({ now, rid: r.rid }));
+      fieldChanges.push({ removed: String(label), count: rows.length });
+    }
+  }
+  if (Array.isArray(changes.setFields) || Array.isArray(changes.addFields)) {
+    const keyRow = db.prepare("SELECT key FROM item WHERE uuid=?").get(uuid);
+    const itemKey = keyRow && Buffer.isBuffer(keyRow.key) && keyRow.key.length ? keyRow.key : null;
+    const seal = (value, sensitive) => {
+      if (value === "" || !sensitive) return String(value);
+      if (!itemKey) throw new Error(`item ${uuid} has no item key, cannot store a sensitive value`);
+      return encryptFieldValue(value, itemKey, uuid);
+    };
+    for (const f of changes.setFields || []) {
+      const row = db.prepare(
+        "SELECT rowid AS rid,sensitive FROM itemfield WHERE item_uuid=? AND type=? AND deleted=0 ORDER BY rowid LIMIT 1",
+      ).get(uuid, f.type);
+      if (!row) throw new Error(`item ${uuid} has no active ${f.type} field`);
+      const vStamp = columns(db, "itemfield").includes("value_updated_at") ? ", value_updated_at=@now" : "";
+      db.prepare(`UPDATE itemfield SET value=@value, updated_at=@now${vStamp} WHERE rowid=@rid`)
+        .run({ value: seal(f.value ?? "", row.sensitive), now, rid: row.rid });
+      fieldChanges.push({ set: f.type });
+    }
+    const add = changes.addFields || [];
+    if (add.length) {
+      const fieldCols = new Set(columns(db, "itemfield"));
+      const used = new Set(fieldCols.has("item_field_uid")
+        ? db.prepare("SELECT item_field_uid u FROM itemfield WHERE item_uuid=?").all(uuid).map((r) => r.u) : []);
+      const ordCol = fieldCols.has("orde") ? "orde" : fieldCols.has("order") ? '"order"' : "rowid";
+      let orde = db.prepare(`SELECT coalesce(max(${ordCol}),0) m FROM itemfield WHERE item_uuid=?`).get(uuid).m;
+      // Every column the vault has gets an explicit value (never NULL, rule 1 in write.js);
+      // older schemas simply lack some of them.
+      const defaults = {
+        deleted: 0, historical: 1, form_id: "", wearable: 0, history: "", initial: "", hash: "", strength: -1,
+        algo_version: ALGO_VERSION, expiry: 0, excluded: 0, pwned_check_time: 0, extra: "",
+        non_compliant_check_time: 0, non_compliant: 0,
+      };
+      const base = ["uuid", "item_uuid", "item_field_uid", "label", "value", "sensitive", "type", "updated_at", "value_updated_at", "orde", "order"]
+        .filter((c) => fieldCols.has(c));
+      const extra = Object.keys(defaults).filter((c) => fieldCols.has(c));
+      const cols = [...base, ...extra];
+      const ins = db.prepare(`INSERT INTO itemfield (${cols.map((c) => `"${c}"`).join(",")}) VALUES (${cols.map((c) => `@${c}`).join(",")})`);
+      for (const f of add) {
+        if (!String(f.label ?? "").trim()) throw new Error("addFields needs a label");
+        let uid;
+        do { uid = 1000 + crypto.randomInt(9000); } while (used.has(uid));
+        used.add(uid);
+        const sensitive = f.sensitive ? 1 : 0;
+        const row = {
+          ...defaults, item_uuid: uuid, item_field_uid: uid, label: String(f.label), value: seal(f.value ?? "", sensitive),
+          sensitive, type: f.type || (sensitive ? "password" : "text"), updated_at: now, value_updated_at: now,
+          uuid: crypto.randomUUID(),
+        };
+        row.orde = row.order = ++orde;
+        ins.run(Object.fromEntries(cols.map((c) => [c, row[c]])));
+        fieldChanges.push({ added: String(f.label) });
+      }
+    }
+  }
+  const fieldStamps = ["field_updated_at", "updated_at"].filter((c) => itemCols.includes(c));
+  if (fieldChanges.length && fieldStamps.length) {
+    db.prepare(`UPDATE item SET ${fieldStamps.map((c) => `${c}=@now`).join(",")} WHERE uuid=@uuid`).run({ now, uuid });
+  }
+  return { uuid, changed: Object.keys(set), urls: urlChange, fields: fieldChanges };
 }
 
 // Copies all rows of `table` whose `key` column equals `uuid`, leaving out the

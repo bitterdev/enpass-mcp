@@ -117,3 +117,37 @@ test("moveItem refuses when the uuid already exists in the target", () => {
   a.db.close();
   b.db.close();
 });
+
+test("editItem clears a field and appends labelled custom fields", () => {
+  const vaultPath = tempVault();
+  const { db, session } = openVault(vaultPath);
+  const before = getItem(session, "item-1");
+  const user = before.fields.find((f) => f.type === "username");
+  assert.ok(user && user.value);
+  const res = editItem(db, "item-1", {
+    setFields: [{ type: "username", value: "" }],
+    addFields: [{ label: "Region", value: "eu-central-1" }],
+  });
+  db.close();
+  assert.equal(res.fields.length, 2);
+  const after = getItem(session, "item-1");
+  assert.equal(after.fields.find((f) => f.type === "username").value, "");
+  assert.equal(after.fields.find((f) => f.label === "Region").value, "eu-central-1");
+  assert.equal(after.fields.length, before.fields.length + 1);
+  const pw = (it) => it.fields.find((f) => f.type === "password");
+  assert.deepEqual(pw(after), pw(before));
+});
+
+test("editItem removes a custom field by label and never a template field", () => {
+  const vaultPath = tempVault();
+  const { db, session } = openVault(vaultPath);
+  const before = getItem(session, "item-1");
+  editItem(db, "item-1", { addFields: [{ label: "Ticket", value: "X-1" }] });
+  const res = editItem(db, "item-1", { removeFields: ["Ticket"] });
+  assert.deepEqual(res.fields, [{ removed: "Ticket", count: 1 }]);
+  assert.throws(() => editItem(db, "item-1", { removeFields: ["Ticket"] }), /no active custom field/);
+  db.close();
+  const after = getItem(session, "item-1");
+  assert.ok(!after.fields.some((f) => f.label === "Ticket"));
+  assert.equal(after.fields.length, before.fields.length);
+});

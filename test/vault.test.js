@@ -14,6 +14,7 @@ import {
   listAttachments,
   readAttachment,
 } from "../src/vault.js";
+import { addAttachment } from "../src/write.js";
 import { createServer } from "../src/server.js";
 import { computeOtp } from "../src/otp.js";
 
@@ -142,9 +143,10 @@ test("get_item surfaces attachment metadata", () => {
   const vaultPath = tempVault("fixture-v4.enpassdb");
   const { session } = unlock(vaultPath);
   const item = getItem(session, "item-1");
-  assert.equal(item.attachments.length, 2);
-  assert.ok(item.attachments.some((a) => a.name === "note.txt"));
-  assert.ok(item.attachments.some((a) => a.name === "photo.bin"));
+  assert.equal(item.attachments.length, 4);
+  for (const name of ["note.txt", "photo.bin", "report.pdf", "config.json"]) {
+    assert.ok(item.attachments.some((a) => a.name === name), `missing ${name}`);
+  }
 });
 
 test("list_attachments and read inline attachment", () => {
@@ -152,7 +154,7 @@ test("list_attachments and read inline attachment", () => {
   const { session } = unlock(vaultPath);
 
   const attachments = listAttachments(session, "item-1");
-  assert.equal(attachments.length, 2);
+  assert.equal(attachments.length, 4);
 
   const inline = readAttachment(session, "item-1", "note.txt");
   assert.equal(inline.mime, "text/plain");
@@ -177,9 +179,99 @@ test("external attachments also work on compat-3 vaults", () => {
   assert.equal(external.buffer.length, 4096);
 });
 
+// The two shapes a real Enpass vault uses. Both were broken while the tests above
+// passed, so they are asserted on the exported bytes, not just on "no error".
+const REALISTIC_FILE = "%PDF-1.4\nrealistic attachment payload\n%%EOF\n";
+
+for (const fixture of ["fixture-v4.enpassdb", "fixture-v3.enpassdb"]) {
+  test(`attachment.password holding a SQLCipher key expression is used verbatim (${fixture})`, () => {
+    const { session } = unlock(tempVault(fixture));
+    const att = readAttachment(session, "item-1", "report.pdf");
+    assert.equal(att.buffer.toString("utf8"), REALISTIC_FILE);
+  });
+
+  test(`a base64 data URI payload is decoded, not exported raw (${fixture})`, () => {
+    const { session } = unlock(tempVault(fixture));
+    const external = readAttachment(session, "item-1", "report.pdf");
+    assert.equal(external.buffer.subarray(0, 5).toString("latin1"), "%PDF-");
+    // The stored data URI is longer than the file, and `size` must be the file's.
+    assert.equal(external.size, external.buffer.length);
+    assert.ok(external.storedSize > external.size);
+    // The media type comes out of the data URI when the row itself has no mime.
+    assert.equal(external.mime, "application/pdf");
+
+    const inline = readAttachment(session, "item-1", "config.json");
+    assert.equal(inline.buffer.toString("utf8"), '{"kind":"inline data uri"}');
+    assert.equal(inline.mime, "application/json");
+  });
+
+  test(`payloads that are not data URIs pass through unchanged (${fixture})`, () => {
+    const { session } = unlock(tempVault(fixture));
+    const inline = readAttachment(session, "item-1", "note.txt");
+    assert.equal(inline.buffer.toString("utf8"), "hello inline attachment");
+    const external = readAttachment(session, "item-1", "photo.bin");
+    assert.equal(external.buffer.length, 4096);
+    assert.ok(external.buffer.every((b) => b === 0xab));
+  });
+}
+
 // --- the write switch ---
 
-const WRITING_TOOLS = ["create_item", "delete_item", "sync_pull"];
+// --- attachment round trip ---
+//
+// The regression this guards: attachments used to be stored as a "data:;base64,..." text
+// blob. Every reader that does not unwrap it, the Enpass app included, then hands out a
+// text file with a .pdf or .jpeg name. So the writer must store raw bytes, and what comes
+// back out must be byte for byte what went in.
+
+test("an attachment written through addAttachment comes back byte for byte", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+  const db = new Database(vaultPath, { fileMustExist: true });
+  db.pragma("cipher='sqlcipher'");
+  db.pragma(`legacy=${session.compat}`);
+  db.pragma(`key="x'${session.hexKey}'"`);
+
+  // Contains 0x00 and byte sequences that are invalid UTF-8, so any text conversion
+  // anywhere along the path corrupts it detectably.
+  const content = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x80, 0xc3, 0x28, 0xed, 0xa0, 0x80, 0x00, 0x1a]);
+  const written = addAttachment(db, vaultPath, "item-1", "probe.jpeg", content);
+  assert.equal(written.size, content.length);
+
+  const back = readAttachment(session, "item-1", "probe.jpeg");
+  assert.deepEqual(back.buffer, content);
+  assert.equal(back.mime, "image/jpeg");
+
+  // and it must be RAW on disk, not a data URI
+  const row = db.prepare("SELECT password FROM attachment WHERE uuid=?").get(written.uuid);
+  const inner = new Database(written.file, { readonly: true, fileMustExist: true });
+  inner.pragma("cipher='sqlcipher'");
+  inner.pragma("legacy=3");
+  inner.pragma(`key="${row.password.toString("latin1")}"`);
+  const stored = inner.prepare("SELECT data FROM attachment ORDER BY ID LIMIT 1").get().data;
+  inner.close();
+  db.close();
+  assert.deepEqual(stored, content, "the payload must be stored raw, not re-encoded");
+});
+
+test("addAttachment refuses a data URI instead of storing it", () => {
+  const vaultPath = tempVault("fixture-v4.enpassdb");
+  const { session } = unlock(vaultPath);
+  const db = new Database(vaultPath, { fileMustExist: true });
+  db.pragma("cipher='sqlcipher'");
+  db.pragma(`legacy=${session.compat}`);
+  db.pragma(`key="x'${session.hexKey}'"`);
+  assert.throws(
+    () => addAttachment(db, vaultPath, "item-1", "probe.pdf", Buffer.from("data:;base64,JVBERi0=")),
+    /data-URI/,
+  );
+  assert.throws(() => addAttachment(db, vaultPath, "item-1", "empty.pdf", Buffer.alloc(0)), /empty/);
+  db.close();
+});
+
+// --- the write switch ---
+
+const WRITING_TOOLS = ["create_item", "delete_item", "add_attachment", "sync_pull"];
 
 function toolNames() {
   return Object.keys(createServer()._registeredTools ?? {});
