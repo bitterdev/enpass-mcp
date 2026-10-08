@@ -131,8 +131,22 @@ function attachmentContent(db, step) {
   return Buffer.from(text, "utf8");
 }
 
+// A field value may also be taken from another field of the same entry ({ from_field: label }),
+// e.g. a one-time code secret that sits in a custom field and belongs in the built-in one.
+function fromField(step, spec, what) {
+  const item = getItem(open[step.vault].session, step.uuid);
+  const src = item && item.fields.find((x) => x.label === spec.from_field && x.value);
+  if (!src) throw new Error(`no field "${spec.from_field}" with a value for "${what}"`);
+  if (spec.sha && sha12(src.value) !== spec.sha) throw new Error(`field "${spec.from_field}" changed since the plan was built`);
+  const { from_field, sha, ...rest } = spec;
+  return { ...rest, value: src.value };
+}
+
 function resolveChanges(db, step) {
   const changes = { ...step.changes };
+  for (const key of ["setFields", "addFields"]) {
+    if (changes[key]) changes[key] = changes[key].map((f) => (f.from_field ? fromField(step, f, f.type || f.label) : f));
+  }
   const needsNote = step.noteSha
     || [...(changes.addFields || []), ...(changes.setFields || [])].some((f) => f.from_note);
   if (!needsNote) return changes;

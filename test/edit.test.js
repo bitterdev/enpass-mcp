@@ -151,3 +151,16 @@ test("editItem removes a custom field by label and never a template field", () =
   assert.ok(!after.fields.some((f) => f.label === "Ticket"));
   assert.equal(after.fields.length, before.fields.length);
 });
+
+test("editItem renames custom fields and leaves template fields alone", () => {
+  const vaultPath = tempVault();
+  const { db, session } = openVault(vaultPath);
+  db.prepare("UPDATE itemfield SET sensitive=0 WHERE item_uuid='item-1'").run();
+  db.transaction(() => editItem(db, "item-1", { addFields: [{ label: "APP_SECRET", value: "x1" }] }))();
+  db.transaction(() => editItem(db, "item-1", { renameFields: [{ from: "APP_SECRET", to: "App Secret" }] }))();
+  assert.throws(() => editItem(db, "item-1", { renameFields: [{ from: "Missing", to: "X" }] }));
+  db.close();
+  const fields = getItem(session, "item-1").fields;
+  assert.equal(fields.filter((f) => f.label === "APP_SECRET").length, 0);
+  assert.equal(fields.find((f) => f.label === "App Secret").value, "x1");
+});

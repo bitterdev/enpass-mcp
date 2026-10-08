@@ -43,6 +43,7 @@ function hasTable(db, name) {
  *   { type: "username", value: "" } so the e-mail shows as the login in the list.
  *   Sensitive fields are encrypted with the item key like the app does.
  * `addFields`: [{ label, value, sensitive?, type? }] appends custom fields.
+ * `renameFields`: [{ from, to }] relabels active custom fields, value and type stay.
  * `removeFields`: [label] marks the active custom fields with that label deleted.
  *   Template fields (uid below CUSTOM_FIELD_UID_MIN) are never touched.
  */
@@ -114,6 +115,20 @@ export function editItem(db, uuid, changes) {
       if (!rows.length) throw new Error(`item ${uuid} has no active custom field "${label}"`);
       rows.forEach((r) => drop.run({ now, rid: r.rid }));
       fieldChanges.push({ removed: String(label), count: rows.length });
+    }
+  }
+  if (Array.isArray(changes.renameFields) && changes.renameFields.length) {
+    const custom = columns(db, "itemfield").includes("item_field_uid")
+      ? `item_field_uid>=${CUSTOM_FIELD_UID_MIN}`
+      : "type NOT IN ('username','email','url','totp','phone','section')";
+    const find = db.prepare(`SELECT rowid AS rid FROM itemfield WHERE item_uuid=? AND label=? AND deleted=0 AND ${custom}`);
+    const relabel = db.prepare("UPDATE itemfield SET label=@label, updated_at=@now WHERE rowid=@rid");
+    for (const { from, to } of changes.renameFields) {
+      if (!String(to ?? "").trim()) throw new Error("renameFields needs a new label");
+      const rows = find.all(uuid, String(from));
+      if (!rows.length) throw new Error(`item ${uuid} has no active custom field "${from}"`);
+      rows.forEach((r) => relabel.run({ label: String(to), now, rid: r.rid }));
+      fieldChanges.push({ renamed: String(from), to: String(to), count: rows.length });
     }
   }
   if (Array.isArray(changes.setFields) || Array.isArray(changes.addFields)) {
