@@ -18,3 +18,8 @@ test("key material belongs in an attachment", () => {
   assert.equal(entryProblems({ title: "Deploy Key", note: pem }).length, 1);
   assert.equal(entryProblems({ title: "Deploy Key", custom: [{ label: "Key", value: pem }] }).length, 1);
 });
+
+test("a ticket number in a custom field is refused", () => {
+  assert.equal(entryProblems({ title: "Quoka Testkonto", custom: [{ label: "Vorgang", value: "JUNO-696" }] }).length, 1);
+  assert.equal(entryProblems({ title: "Quoka Testkonto", custom: [{ label: "Region", value: "eu-central-1" }] }).length, 0);
+});

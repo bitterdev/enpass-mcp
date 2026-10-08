@@ -16,6 +16,7 @@ export function entryProblems({ title = "", subtitle = "", note = "", custom = [
   if (PEM.test(note) || PEM.test(subtitle)) problems.push("key or certificate in the text, store it as an attachment (add_attachment)");
   for (const f of custom) {
     if (PEM.test(String(f.value ?? ""))) problems.push(`field "${f.label}" holds a key or certificate, store it as an attachment`);
+    if (TICKET.test(`${f.label ?? ""} ${f.value ?? ""}`)) problems.push(`field "${f.label}" contains a ticket number, keep run and ticket notes out of the vault`);
   }
   return problems;
 }
