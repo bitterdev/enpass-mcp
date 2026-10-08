@@ -117,6 +117,19 @@ export function editItem(db, uuid, changes) {
       fieldChanges.push({ removed: String(label), count: rows.length });
     }
   }
+  if (Array.isArray(changes.clearFields) && changes.clearFields.length) {
+    // Template rows must stay present (rule 2 in write.js), so a labelled template field whose
+    // value moved elsewhere is emptied instead of removed.
+    const find = db.prepare("SELECT rowid AS rid FROM itemfield WHERE item_uuid=? AND label=? AND deleted=0");
+    const vStamp = columns(db, "itemfield").includes("value_updated_at") ? ", value_updated_at=@now" : "";
+    const empty = db.prepare(`UPDATE itemfield SET value='', updated_at=@now${vStamp} WHERE rowid=@rid`);
+    for (const label of changes.clearFields) {
+      const rows = find.all(uuid, String(label));
+      if (!rows.length) throw new Error(`item ${uuid} has no active field "${label}"`);
+      rows.forEach((r) => empty.run({ now, rid: r.rid }));
+      fieldChanges.push({ cleared: String(label), count: rows.length });
+    }
+  }
   if (Array.isArray(changes.renameFields) && changes.renameFields.length) {
     const custom = columns(db, "itemfield").includes("item_field_uid")
       ? `item_field_uid>=${CUSTOM_FIELD_UID_MIN}`

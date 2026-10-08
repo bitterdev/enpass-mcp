@@ -152,6 +152,20 @@ test("editItem removes a custom field by label and never a template field", () =
   assert.equal(after.fields.length, before.fields.length);
 });
 
+test("editItem empties a labelled field, template rows included, without removing it", () => {
+  const vaultPath = tempVault();
+  const { db, session } = openVault(vaultPath);
+  db.prepare("UPDATE itemfield SET label='API Key' WHERE item_uuid='item-1' AND type='username'").run();
+  const before = getItem(session, "item-1");
+  const res = editItem(db, "item-1", { clearFields: ["API Key"] });
+  assert.deepEqual(res.fields, [{ cleared: "API Key", count: 1 }]);
+  assert.throws(() => editItem(db, "item-1", { clearFields: ["Missing"] }), /no active field/);
+  db.close();
+  const after = getItem(session, "item-1");
+  assert.equal(after.fields.find((f) => f.label === "API Key").value, "");
+  assert.equal(after.fields.length, before.fields.length);
+});
+
 test("editItem renames custom fields and leaves template fields alone", () => {
   const vaultPath = tempVault();
   const { db, session } = openVault(vaultPath);

@@ -70,7 +70,16 @@ for (const name of touched) {
 
 const results = [];
 let failed = 0;
+// A step may name the ids of earlier steps it `needs`, e.g. removing a field only after the
+// entry that received its value was created and read back. It is skipped when one of them failed.
+const done = new Set();
 for (const step of plan) {
+  const missing = (step.needs || []).filter((id) => !done.has(id));
+  if (missing.length) {
+    failed++;
+    results.push({ ...step, ok: false, error: `skipped, needs ${missing.join(", ")}` });
+    continue;
+  }
   try {
     if (dryRun) {
       const dbs = step.op === "move" ? [open[step.from].db, open[step.to].db] : [open[step.vault].db];
@@ -83,6 +92,7 @@ for (const step of plan) {
     } else {
       results.push({ ...step, ok: true, result: runStep(step, false) });
     }
+    if (step.id) done.add(step.id);
   } catch (err) {
     failed++;
     results.push({ ...step, ok: false, error: err.message });
@@ -124,8 +134,23 @@ function pemFile(body, label) {
   return `-----BEGIN ${label}-----\n${clean.match(/.{1,64}/g).join("\n")}\n-----END ${label}-----\n`;
 }
 
+// A key kept as text in a field, or a key file attached to a separate key entry, becomes an
+// attachment of the entry that uses it. `sha` pins the trimmed text the plan was built from.
+function keyText(value, sha, what) {
+  const text = String(value).replace(/\r/g, "").trim();
+  if (sha && sha12(text) !== sha) throw new Error(`${what} changed since the plan was built`);
+  return Buffer.from(`${text}\n`, "utf8");
+}
+
 function attachmentContent(db, step) {
   if (step.file) return fs.readFileSync(step.file);
+  if (step.from_field) {
+    return keyText(fromField(step, { from_field: step.from_field, of: step.of }, step.name).value, step.sha, `field "${step.from_field}"`);
+  }
+  if (step.from_attachment) {
+    const buf = readAttachment(open[step.vault].session, step.from_attachment.uuid, step.from_attachment.name).buffer;
+    return keyText(buf.toString("utf8"), step.sha, `attachment "${step.from_attachment.name}"`);
+  }
   const value = fromNote(currentNote(db, step.uuid_note || step.uuid, step.noteSha), step, step.name);
   const text = step.pem ? pemFile(value, step.pem) : value.endsWith("\n") ? value : `${value}\n`;
   return Buffer.from(text, "utf8");
@@ -133,14 +158,18 @@ function attachmentContent(db, step) {
 
 // A field value may also be taken from another field of the same entry ({ from_field: label }),
 // e.g. a one-time code secret that sits in a custom field and belongs in the built-in one.
+// `of` reads another entry of the same vault, `slice` ([start, end], code points) takes part of
+// the value, e.g. one line of a text field that holds several values.
 function fromField(step, spec, what) {
-  const item = getItem(open[step.vault].session, step.uuid);
+  const item = getItem(open[step.vault].session, spec.of || step.uuid);
   const src = item && item.fields.find((x) => x.label === spec.from_field && x.value
     && (!spec.from_type || x.type === spec.from_type));
   if (!src) throw new Error(`no field "${spec.from_field}" with a value for "${what}"`);
-  if (spec.sha && sha12(src.value) !== spec.sha) throw new Error(`field "${spec.from_field}" changed since the plan was built`);
-  const { from_field, from_type, sha, ...rest } = spec;
-  return { ...rest, value: src.value };
+  const value = spec.slice ? Array.from(src.value).slice(spec.slice[0], spec.slice[1]).join("") : src.value;
+  if (spec.sha && sha12(value) !== spec.sha) throw new Error(`field "${spec.from_field}" changed since the plan was built`);
+  if (!value) throw new Error(`field "${spec.from_field}" gives an empty value for "${what}"`);
+  const { from_field, from_type, sha, of, slice, ...rest } = spec;
+  return { ...rest, value };
 }
 
 function resolveChanges(db, step) {
@@ -220,6 +249,31 @@ function runStep(step, dry) {
     if (problems.length) throw new Error(`new entry ${created} does not read back (${problems.join(", ")}), note entry kept`);
     o.db.transaction(() => deleteItem(o.db, step.uuid))();
     return { created, retired: step.uuid, fields: custom.length, attachments: files.length };
+  }
+  if (step.op === "create") {
+    // A value that sits in the wrong entry gets an entry of its own. Template values and custom
+    // fields may name a field of an existing entry ({ from_field, of, slice, sha }), so the plan
+    // holds no secret; the new entry is read back value by value before the step counts.
+    const o = open[step.vault];
+    const pick = (spec, what) => (spec && spec.from_field ? fromField(step, spec, what).value : spec?.value ?? "");
+    const values = { username: "", email: "", password: "", url: "", totp: "" };
+    for (const [k, spec] of Object.entries(step.values || {})) values[k] = pick(spec, k);
+    const custom = (step.custom || []).map((c) => ("from_field" in c ? fromField(step, c, c.label) : c));
+    if (dry) return { checked: true, fields: custom.length };
+    let created;
+    o.db.transaction(() => {
+      created = insertItem(o.db, { title: step.title, subtitle: step.subtitle ?? "", note: step.note ?? "", values, custom });
+    })();
+    const back = getItem(o.session, created);
+    const val = (t) => (back.fields.find((x) => x.type === t && !x.label) || {}).value ?? "";
+    const problems = [];
+    for (const t of ["username", "email", "password", "url"]) if (val(t) !== values[t]) problems.push(t);
+    for (const c of custom) if (!back.fields.some((x) => x.label === c.label && x.value === c.value)) problems.push(c.label);
+    if (problems.length) {
+      o.db.transaction(() => deleteItem(o.db, created))();
+      throw new Error(`new entry does not read back (${problems.join(", ")}), removed again`);
+    }
+    return { created, title: step.title, fields: custom.length };
   }
   throw new Error(`unknown op ${step.op}`);
 }
