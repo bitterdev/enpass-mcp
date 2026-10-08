@@ -19,7 +19,7 @@ import {
   listAttachments,
   readAttachment,
 } from "./vault.js";
-import { computeOtp, isOtpValue } from "./otp.js";
+import { computeOtp, isOtpValue, totpFieldValue } from "./otp.js";
 import { entryProblems } from "./hygiene.js";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3-multiple-ciphers";
@@ -380,6 +380,10 @@ export function createServer() {
         email: z.string().optional(),
         password: z.string().optional(),
         url: z.string().optional(),
+        totp: z
+          .string()
+          .optional()
+          .describe("One-time code secret (base32 or otpauth URI), stored in the built-in TOTP field so Enpass shows the code"),
         note: z.string().optional(),
         subtitle: z.string().optional(),
         custom: z
@@ -388,7 +392,7 @@ export function createServer() {
           .describe("Extra fields beyond the template, e.g. [{label:'SMTP Port', value:'587'}]"),
       },
     },
-    async ({ vault, title, username, email, password, url, note, subtitle, custom }) => {
+    async ({ vault, title, username, email, password, url, totp, note, subtitle, custom }) => {
       const blocked = requireClosed();
       if (blocked) return blocked;
       const problems = entryProblems({ title, subtitle, note, custom });
@@ -401,7 +405,7 @@ export function createServer() {
             title,
             subtitle: subtitle ?? "",
             note: note ?? "",
-            values: { username, email, password, url },
+            values: { username, email, password, url, totp: totpFieldValue(totp) },
             custom: custom ?? [],
           });
         })();

@@ -23,3 +23,9 @@ test("a ticket number in a custom field is refused", () => {
   assert.equal(entryProblems({ title: "Quoka Testkonto", custom: [{ label: "Vorgang", value: "JUNO-696" }] }).length, 1);
   assert.equal(entryProblems({ title: "Quoka Testkonto", custom: [{ label: "Region", value: "eu-central-1" }] }).length, 0);
 });
+
+test("a one-time code secret in a custom field is refused", () => {
+  assert.equal(entryProblems({ title: "Upwork", custom: [{ label: "TOTP", value: "JBSWY3DPEHPK3PXP" }] }).length, 1);
+  assert.equal(entryProblems({ title: "Amazon", custom: [{ label: "Schlüssel", value: "otpauth://totp/A:b?secret=JBSWY3DPEHPK3PXP" }] }).length, 1);
+  assert.equal(entryProblems({ title: "Amazon", custom: [{ label: "Kundennummer", value: "12345" }] }).length, 0);
+});

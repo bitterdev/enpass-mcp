@@ -21,6 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { deleteItem, encryptFieldValue, ALGO_VERSION } from "./write.js";
+import { totpFieldValue } from "./otp.js";
 
 const TEMPLATE_URL_UID = 13;
 // The app numbers user-added fields from 1000 up, template fields stay below.
@@ -130,7 +131,7 @@ export function editItem(db, uuid, changes) {
       if (!row) throw new Error(`item ${uuid} has no active ${f.type} field`);
       const vStamp = columns(db, "itemfield").includes("value_updated_at") ? ", value_updated_at=@now" : "";
       db.prepare(`UPDATE itemfield SET value=@value, updated_at=@now${vStamp} WHERE rowid=@rid`)
-        .run({ value: seal(f.value ?? "", row.sensitive), now, rid: row.rid });
+        .run({ value: seal(f.type === "totp" ? totpFieldValue(f.value) : f.value ?? "", row.sensitive), now, rid: row.rid });
       fieldChanges.push({ set: f.type });
     }
     const add = changes.addFields || [];

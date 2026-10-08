@@ -4,7 +4,9 @@
 // log in title, subtitle or note, and key material as an attachment instead of note text.
 // Returns the list of problems; an empty list means the entry may be written.
 
-const TICKET = /\bJUNO-\d+\b/i;
+import { isTotpLikeField } from "./otp.js";
+
+const TICKET =/\bJUNO-\d+\b/i;
 const PEM = /-----BEGIN [A-Z0-9 ]*(PRIVATE KEY|CERTIFICATE)-----/;
 
 export function entryProblems({ title = "", subtitle = "", note = "", custom = [] } = {}) {
@@ -17,6 +19,7 @@ export function entryProblems({ title = "", subtitle = "", note = "", custom = [
   for (const f of custom) {
     if (PEM.test(String(f.value ?? ""))) problems.push(`field "${f.label}" holds a key or certificate, store it as an attachment`);
     if (TICKET.test(`${f.label ?? ""} ${f.value ?? ""}`)) problems.push(`field "${f.label}" contains a ticket number, keep run and ticket notes out of the vault`);
+    if (isTotpLikeField(f)) problems.push(`field "${f.label}" looks like a one-time code secret, pass it as totp so Enpass shows the code`);
   }
   return problems;
 }
