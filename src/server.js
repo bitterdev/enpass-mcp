@@ -27,7 +27,7 @@ import { insertItem, deleteItem, addAttachment, finalizeVault, pushSync, pullSyn
 import { discoverSyncedVaults, syncTargetFor, remoteStatus } from "./foldersync.js";
 
 function findOtpField(item) {
-  return item.fields.find((f) => f.type === "totp" || isOtpValue(f.value));
+  return item.fields.find((f) => (f.type === "totp" && f.value) || isOtpValue(f.value));
 }
 
 // First field of one of the given types that actually holds a value. Entries often

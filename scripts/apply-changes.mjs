@@ -135,17 +135,20 @@ function attachmentContent(db, step) {
 // e.g. a one-time code secret that sits in a custom field and belongs in the built-in one.
 function fromField(step, spec, what) {
   const item = getItem(open[step.vault].session, step.uuid);
-  const src = item && item.fields.find((x) => x.label === spec.from_field && x.value);
+  const src = item && item.fields.find((x) => x.label === spec.from_field && x.value
+    && (!spec.from_type || x.type === spec.from_type));
   if (!src) throw new Error(`no field "${spec.from_field}" with a value for "${what}"`);
   if (spec.sha && sha12(src.value) !== spec.sha) throw new Error(`field "${spec.from_field}" changed since the plan was built`);
-  const { from_field, sha, ...rest } = spec;
+  const { from_field, from_type, sha, ...rest } = spec;
   return { ...rest, value: src.value };
 }
 
 function resolveChanges(db, step) {
   const changes = { ...step.changes };
   for (const key of ["setFields", "addFields"]) {
-    if (changes[key]) changes[key] = changes[key].map((f) => (f.from_field ? fromField(step, f, f.type || f.label) : f));
+    // An empty label ("") names a template field, so test for presence, not truthiness:
+    // on 08.10.2026 a truthiness test skipped five such specs and wrote empty key fields.
+    if (changes[key]) changes[key] = changes[key].map((f) => ("from_field" in f ? fromField(step, f, f.type || f.label) : f));
   }
   const needsNote = step.noteSha
     || [...(changes.addFields || []), ...(changes.setFields || [])].some((f) => f.from_note);
