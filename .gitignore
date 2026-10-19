@@ -17,3 +17,5 @@ vault.json
 # OS / editor noise
 .DS_Store
 *.log
+.env.*
+!.env.example
